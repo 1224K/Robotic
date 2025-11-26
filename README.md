@@ -15,13 +15,27 @@
 4. Download the USD files from Google Drive, unzip them, and place them in the project root directory.
   
     ```bash
-    Robotic
-    - scriptes
-    - source
-    - Fan.usd
-    - Plate.usd
-    - Rack.usd
-    - RobotLeftArm.usd
+    Robotic/
+    ├── scripts/
+    │   ├── list_envs.py
+    │   ├── view_env.py
+    │   ├── rl_games/
+    │   │   ├── train.py
+    │   │   └── play.py
+    ├── source/
+    │   └── Robotic/
+    │       ├── tasks/
+    │       │   └── direct/
+    │       │       └── robotic/
+    │       │           ├── robotic_env.py     (如何跟環境互動，獎勵訊號)
+    │       │           └── robotic_env_cfg.py (初始要用到的一些參數值)
+    │       └── robots/
+    │           └── RS_M90E7A/                 (左手臂的配置檔，目前是用速度控制)
+    ├── Fan.usd
+    ├── Plate.usd
+    ├── Rack.usd
+    └── RobotLeftArm.usd
+
 
 5. Verify that the extension is correctly installed by:
   
@@ -33,7 +47,7 @@
           # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
           python scripts/list_envs.py
 
-    - Running a random agent:
+    - Launch a random agent:
 
           # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
           python scripts/view.py
@@ -49,3 +63,33 @@
 7. Play with checkpoint
     ```bash
     python scripts/rl_games/play.py --task=Template-Robotic-Direct-v0 --checkpoint=
+
+## Docs
+- Environment Overview
+
+  | Component           | Description                                                         |
+  | ------------------- | ------------------------------------------------------------------- |
+  | **Robot**           | 7-DOF manipulator (RS_M90E7A) with dual sliders for gripper control |
+  | **Objects**         | Rigid bodies loaded via USD files (`Fan`, `Plate`, `Rack`)          |
+  | **Scene**           | Includes ground plane, dome light, and physics-based interactions   |
+  | **Action Type**     | Continuous velocity control (`Box[-1,1]^7 + gripper [-0.2, 0.2]`)   |
+  | **Simulation Step** | `dt = 1/120 s`, with decimation factor of 2                         |
+  | **Number of Envs**  | Configurable (`--num_envs` argument)                                |
+
+- Observation Space
+
+  | Feature                         | Dimension | Description                                    |
+  | ------------------------------- | --------- | ---------------------------------------------- |
+  | Joint positions                 | 7         | Robot arm revolute joints                      |
+  | Joint velocities                | 7         | Angular velocity of each joint                 |
+  | Gripper position                | 1         | Linear position of the slider joint            |
+  | **Fan position**                | 3         | `(x, y, z)` world position of the `Fan` object |
+  | (optional) Plate/Rack positions | 3 each    | Positions of other rigid objects               |
+
+- Action Space
+
+  | Type       | Dimension | Range                                          | Description                                     |
+  | ---------- | --------- | ---------------------------------------------- | ----------------------------------------------- |
+  | Continuous | 8         | `[-1,1]^7` (revolute) + `[-0.2,0.2]` (gripper) | Joint velocity targets applied to the robot arm |
+
+3. Reward
