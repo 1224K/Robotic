@@ -22,6 +22,7 @@ from .robotic_env_cfg import RoboticEnvCfg
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 import isaaclab.utils.math as math_utils
+from .pose_monitor import PoseMonitor
 
 from gym import spaces
 import numpy as np
@@ -116,6 +117,19 @@ class RoboticEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
         self.jacobians = None
+
+        self.monitors = []
+        for i in range(self.num_envs):
+            m = PoseMonitor.create_default(
+                robot_prim_path=f"/World/envs/env_{i}/Robot",
+                fan_prim_path=f"/World/envs/env_{i}/fan",
+                ground_truth_prim_path=f"/World/envs/env_{i}/rack",
+                robot_description_path=self.cfg.robot_description_path,
+                urdf_path=self.cfg.robot_urdf_path,
+            )
+            self.monitors.append(m)
+        
+        self._monitor_inited = False
 
     def _init_tensors_once(self):
         self.prev_actions = torch.zeros((self.num_envs, self.action_space.shape[0]), device=self.device)
@@ -266,6 +280,11 @@ class RoboticEnv(DirectRLEnv):
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
         super()._reset_idx(env_ids)
+
+        if not getattr(self, "_monitor_inited", False):
+            for m in self.monitors:
+                m.initialize()
+            self._monitor_inited = True
 
         # set the root state for the reset envs
         default_root_state = self.robot.data.default_root_state[env_ids]

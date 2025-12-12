@@ -44,6 +44,8 @@ class RoboticEnvCfg(DirectRLEnvCfg):
     fan_usd: str   = str(ASSET_DIR / "Fan.usd")
     plate_usd: str = str(ASSET_DIR / "Plate.usd")
     rack_usd: str  = str(ASSET_DIR / "Rack.usd")
+    robot_description_path: str = str(ASSET_DIR / "robot_description.yaml")
+    robot_urdf_path: str = str(ASSET_DIR / "RS-M90E7A.urdf")
     
     fan_spawn_base: tuple[float,float,float] = (0.0, -0.7, 0.0)
     plate_spawn_base: tuple[float,float,float] = (0.0, -0.7, 0.0)

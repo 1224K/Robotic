@@ -51,7 +51,7 @@
     - Launch a random agent:
 
           # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-          python scripts/view.py
+          python scripts/view_env.py
 
 6. Train an RL agent
     ```bash
