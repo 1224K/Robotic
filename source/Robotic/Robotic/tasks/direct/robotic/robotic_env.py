@@ -26,6 +26,10 @@ import isaaclab.utils.math as math_utils
 from gym import spaces
 import numpy as np
 
+from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
+from .pose_monitor import PoseMonitor
+from .grasp_config import GraspDetectionConfig
+
 class RoboticEnv(DirectRLEnv):
     cfg: RoboticEnvCfg
 
@@ -33,12 +37,15 @@ class RoboticEnv(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
 
         self.dof_idx, _ = self.robot.find_joints(self.cfg.dof_names)
+        self.arm_dof_ids, _ = self.robot.find_joints([f"Revolute{i}" for i in range(1, 8)])
+        self.grip_dof_ids, _ = self.robot.find_joints(["Slider9", "Slider10"])
 
-        # action_space: 8 DOF velocity control
-        # revolute joints: [-1.0, 1.0] rad/s
-        # prismatic joints (gripper): [-0.2, 0.2] m/s
-        low  = np.array([-1.0]*7 + [-0.2], dtype=np.float32)
-        high = np.array([ 1.0]*7 + [ 0.2], dtype=np.float32)
+        # EE delta position (meters per step) + gripper command
+        ee_step = 0.003   # 3 mm / step（很穩，之後可調）
+
+        low  = np.array([-ee_step, -ee_step, -ee_step, -1.0], dtype=np.float32)
+        high = np.array([ ee_step,  ee_step,  ee_step,  1.0], dtype=np.float32)
+
         self.action_space = spaces.Box(low=low, high=high, dtype=np.float32)
         
         names = self.robot.body_names
@@ -53,13 +60,24 @@ class RoboticEnv(DirectRLEnv):
         self._fan_spawn_local_pos  = fan_world_pos  - self.scene.env_origins  # local
         self._fan_spawn_local_quat = fan_world_quat.clone()                     # 世界四元數 = local（根是 env_x 原點）
 
+        self.ik_cfg = DifferentialIKControllerCfg(
+            command_type="position",          
+            use_relative_mode=True,        
+            ik_method="dls",                  # damped least squares
+        )
+
+        self.ik_controller = DifferentialIKController(
+            cfg=self.ik_cfg,
+            num_envs=self.num_envs,
+            device=self.device,
+        )
+        
         # test
         print("dt =", self.cfg.sim.dt, "decimation =", self.cfg.decimation)
         print("episode_length_s =", self.cfg.episode_length_s)
         print("max_episode_length (expected) ≈",
             int(self.cfg.episode_length_s / (self.cfg.sim.dt * self.cfg.decimation)))
         print("actual max_episode_length (env) =", int(self.max_episode_length))
-
 
     def _setup_scene(self):
         self.robot = Articulation(self.cfg.robot_cfg)
@@ -105,6 +123,18 @@ class RoboticEnv(DirectRLEnv):
 
         self.jacobians = None
 
+        # monitor
+        self.monitor = []
+        for i in range(self.num_envs):
+            mon = PoseMonitor.create_default(
+                robot_prim_path=f"/World/envs/env_{i}/Robot/RS_M90E7A_Left",
+                fan_prim_path=f"/World/envs/env_{i}/fan",
+                ground_truth_prim_path=f"/World/envs/env_{i}/rack",
+            )
+            self.monitor.append(mon)
+        
+        self.monitor_initized = False
+
     def _init_tensors_once(self):
         self.prev_actions = torch.zeros((self.num_envs, self.action_space.shape[0]), device=self.device)
         self.prev_xy_dist = torch.zeros((self.num_envs,), device=self.device)
@@ -114,78 +144,105 @@ class RoboticEnv(DirectRLEnv):
         self.fan_quat= torch.zeros((self.num_envs, 4), device=self.device)
     
     def _compute_intermediate(self):
-        # EE pose
-        i3, i4 = self._finger_idx_pair
-        p3 = self.robot.data.body_pos_w[:, i3]
-        p4 = self.robot.data.body_pos_w[:, i4]
-        self.ee_pos = 0.5 * (p3 + p4) - self.scene.env_origins
-        # 四元數可用其中一指或 gripper_base_2（若存在）代表
-        if "TF_1" in self.robot.body_names:
-            itf = self.robot.body_names.index("TF_1")
-            self.ee_quat = self.robot.data.body_quat_w[:, itf]
-        else:
-            self.ee_quat = self.robot.data.body_quat_w[:, i3]
+        ## EE pose = TF_1
+        # itf = self.robot.body_names.index("TF_1")
+        # self.ee_pos  = self.robot.data.body_pos_w[:, itf] - self.scene.env_origins
+        # self.ee_quat = self.robot.data.body_quat_w[:, itf]
 
-        # fan pose 
+        ## use monitor to get more accurate EE pos
+        # ee_pose = monitor.get_end_effector_pose()
+        # print(f"夾爪位置: {ee_pose.p}")      # 輸出: [x, y, z] 三維座標
+        # print(f"夾爪姿態: {ee_pose.q}")      # 輸出: [w, x, y, z] 四元數
+        ee_p_list = []
+        ee_q_list = []
+
+        for mon in self.monitor:
+            pose = mon.get_end_effector_pose()   # PosePq
+            # pose.p: (3,)  pose.q: (4,)  (usually numpy or list)
+            ee_p_list.append(torch.as_tensor(pose.p, device=self.device, dtype=torch.float32))
+            ee_q_list.append(torch.as_tensor(pose.q, device=self.device, dtype=torch.float32))
+
+        ee_p = torch.stack(ee_p_list, dim=0)   # (N,3)
+        ee_q = torch.stack(ee_q_list, dim=0)   # (N,4)
+
+        # 如果 monitor 回來的是 world pose，你這裡照你原本做法轉成 env-local
+        self.ee_pos  = ee_p - self.scene.env_origins
+        self.ee_quat = ee_q
+
         self.fan_pos  = self.fan.data.root_pos_w - self.scene.env_origins
         self.fan_quat = self.fan.data.root_quat_w
 
-        # gripper 開口（兩 slider 距離）
         idx10 = self.cfg.dof_names.index("Slider10")
         idx09 = self.cfg.dof_names.index("Slider9")
         jpos = self.robot.data.joint_pos
         self.gripper_gap = (jpos[:, idx10] - jpos[:, idx09]).abs()
 
+    def _update_jacobian(self):
+        # 1) EE body index (cache once is fine)
+        if not hasattr(self, "_ee_body_idx"):
+            self._ee_body_idx = self.robot.body_names.index("TF_1")
+
+        # 2) extract EE Jacobian for arm joints
+        # shape: (N, 6, 7)
+        J_all = self.robot.root_physx_view.get_jacobians()  # (N, num_bodies, 6, num_dof)
+        J = J_all[:, self._ee_body_idx, :, self.arm_dof_ids]  # (N, 6, 7)
+        self.jacobians = J
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = actions.clone()
 
     def _apply_action(self) -> None:
-        if self.actions.dim() > 2:
-            self.actions = self.actions[:, 0, :]
+        # ---- 0) actions shape -> (N,4) ----
+        actions = self.actions
+        if actions.dim() == 3:
+            actions = actions[:, 0, :]
+        assert actions.shape[-1] == 4, f"Expected action dim=4 (Δx,Δy,Δz,g), got {actions.shape}"
 
-        # --- 動作平滑，避免抖動 ---
-        if not hasattr(self, "_action_smooth"):
-            self._action_smooth = 0.5  # 0~1, 值越大越平滑
-        self.actions = (1 - self._action_smooth) * self.actions + self._action_smooth * self.prev_actions
+        # ---- 2) split ----
+        ee_delta = actions[:, :3]     # (N,3)
+        g_cmd    = actions[:, 3]      # (N,)
 
-        joint_vels = self.robot.data.default_joint_pos.clone()
-        # arm 7 joints
-        arm = self.actions[:, :7]
-        # gripper speed (m/s)
-        g_raw = torch.clamp(self.actions[:, 7], -0.2, 0.2)
+        # ---- 3) clamp EE step (safety) ----
+        ee_step = 0.003
+        ee_delta = torch.clamp(ee_delta, -ee_step, ee_step)
 
-        # --- gate：距離太遠就禁止夾爪動作 ---
-        # 在 _compute_intermediate 已經計了 self.ee_pos/self.fan_pos；此處先算一次距離
-        rel = (self.ee_pos - self.fan_pos)
-        dist = torch.linalg.norm(rel, dim=-1)      # 3D距離
-        mask = (dist < self.cfg.align_thresh).float()  # 太遠就不動作
-        g = g_raw * mask
+        # ---- 4) update current EE pose ----
+        self._compute_intermediate()
+        self._update_jacobian()
+        ee_pos  = self.ee_pos
+        ee_quat = self.ee_quat
 
-        joint_vels[:, :7] = arm
-        # 兩邊反向
-        joint_vels[:, 7]  =  g
-        joint_vels[:, 8]  = -g
+        # ---- 5) IK command (relative) ----
+        # Requires cfg.command_type="position" and cfg.use_relative_mode=True
+        self.ik_controller.set_command(ee_delta, ee_pos=ee_pos, ee_quat=ee_quat)
 
-        # self.robot.set_joint_effort_target(joint_vels, joint_ids=self.dof_idx)
-        # self.robot.set_joint_position_target(joint_vels, joint_ids=self.dof_idx)
-        self.robot.set_joint_velocity_target(joint_vels, joint_ids=self.dof_idx)
+        # ---- 6) compute arm joint velocities ----
+        q_arm = self.robot.data.joint_pos[:, self.arm_dof_ids]   # (N,7)
+        J = self.jacobians                         # (N,6,7) for the SAME EE link as ee_pos/quat
 
-        # test: 讓 fan 緩慢移動到 EE 
-        # # 1) 方向：由 fan 指向 EE
-        # rel = (self.ee_pos - self.fan_pos)               # [N,3]
-        # dist = torch.linalg.norm(rel, dim=-1).clamp(min=1e-8)
-        # dirn = rel / dist.unsqueeze(-1)                  # 單位向量
+        qd_arm = self.ik_controller.compute(
+            jacobian=J,
+            joint_pos=q_arm,
+            ee_pos=ee_pos,
+            ee_quat=ee_quat,
+        )  # -> (N,7)
 
-        # # 2) 單步位移 = v * dt_env
-        # # DirectRLEnv 的「控制步 dt_env」= sim.dt * decimation
-        # dt_env = self.cfg.sim.dt * self.cfg.decimation
-        # step = 0.02 * dt_env         # m/step
+        # ---- 7) assemble full joint velocity target (7 arm + 2 gripper) ----
+        joint_vels = torch.zeros_like(self.robot.data.joint_pos)  # (N,9)
 
-        # fan_state = self.fan.data.root_state_w.clone()      # [N,13] 或 [N,?]，前3為位置
-        # fan_state[:, :3] += dirn * step
-        # #（可選）保持角度不變；若想面向 EE 可在此改 fan_state[:,3:7]
-        # self.fan.write_root_state_to_sim(fan_state)
+        # arm
+        joint_vels[:, self.arm_dof_ids] = qd_arm
 
+        # gripper: map g_cmd (-1..1) -> slider speed (m/s)
+        # IMPORTANT: keep small to avoid contact blow-ups
+        g_speed = torch.clamp(g_cmd, -1.0, 1.0) * 0.05  # 0.05 m/s safe start
+
+        joint_vels[:, self.grip_dof_ids[0]] =  g_speed   # Slider9
+        joint_vels[:, self.grip_dof_ids[1]] = -g_speed   # Slider10
+
+        # ---- 8) apply ----
+        self.robot.set_joint_velocity_target(joint_vels)
+    
     def _get_observations(self) -> dict:
         self._compute_intermediate()
 
@@ -197,9 +254,9 @@ class RoboticEnv(DirectRLEnv):
             self.fan_quat,              # 4
             self.fan_pos,               # 3
             self.gripper_gap.unsqueeze(-1),  # 1
-            self.prev_actions           # 8
+            self.prev_actions           # 4
         ]
-        obs = torch.cat(obs_list, dim=-1)  # 維度 = 3+4+4+3+1+8 = 23
+        obs = torch.cat(obs_list, dim=-1)  # 維度 = 3+4+4+3+1+4 = 19
         self.cfg.observation_space = obs.shape[-1]  # 動態校正
 
         return {"policy": obs}
@@ -208,9 +265,21 @@ class RoboticEnv(DirectRLEnv):
         self._compute_intermediate()
 
         # === 1) 距離 ===
-        rel = self.ee_pos - self.fan_pos
-        dist = torch.linalg.norm(rel, dim=-1)      # 3D距離
-        r_reach = -dist                            # 距離越近獎勵越高（越負越不好）
+        ## use fingers midpoint as EE
+        i3, i4 = self._finger_idx_pair
+        p3 = self.robot.data.body_pos_w[:, i3]
+        p4 = self.robot.data.body_pos_w[:, i4]
+        finger_pos = 0.5 * (p3 + p4) - self.scene.env_origins
+        rel = finger_pos - self.fan_pos
+        print("fingers-距離獎勵:", rel)
+
+        ## use monitor EE directly
+        r_reach_list = []
+        for mon in self.monitor:
+            error = mon.get_ee_to_fan_error()
+            r_reach_list.append(-torch.as_tensor(error.distance, device=self.device, dtype=torch.float32))
+        r_reach = torch.stack(r_reach_list, dim=0)   # (N,)
+        print("monitor-距離獎勵:", r_reach)
 
         # === 2) 夾緊成功 ===
         # close_ok = (self.gripper_gap < self.cfg.grasp_width_close_threshold)
@@ -246,10 +315,15 @@ class RoboticEnv(DirectRLEnv):
         return done, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
-        
         if env_ids is None:
             env_ids = self.robot._ALL_INDICES
         super()._reset_idx(env_ids)
+
+        # initialize monitors
+        if not self.monitor_initized:
+            for mon in self.monitor:
+                mon.initialize()
+            self.monitor_initized = True
 
         # set the root state for the reset envs
         default_root_state = self.robot.data.default_root_state[env_ids]

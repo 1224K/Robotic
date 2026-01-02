@@ -3,13 +3,11 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Sequence, Tuple
-
-import numpy as np
+from typing import TYPE_CHECKING, Any, Optional, Sequence, Tuple
 from isaacsim.core.prims import SingleXFormPrim
-from isaacsim.core.utils.rotations import quat_to_rot_matrix, rot_matrix_to_quat
 from pxr import Usd
 
+from .array_backend import mathops as mo
 from .grasp_config import PosePq
 
 if TYPE_CHECKING:
@@ -25,20 +23,20 @@ __all__ = ["TargetObject"]
 # Helper functions for coordinate frame transformation
 # ---------------------------------------------------------------------------
 
-def _axis_string_to_vector(axis: str) -> np.ndarray:
+def _axis_string_to_vector(axis: str) -> Any:
     """Convert axis string (e.g., "+x", "-y") to unit vector."""
     axis_vectors = {
-        "+x": np.array([1.0, 0.0, 0.0]),
-        "-x": np.array([-1.0, 0.0, 0.0]),
-        "+y": np.array([0.0, 1.0, 0.0]),
-        "-y": np.array([0.0, -1.0, 0.0]),
-        "+z": np.array([0.0, 0.0, 1.0]),
-        "-z": np.array([0.0, 0.0, -1.0]),
+        "+x": (1.0, 0.0, 0.0),
+        "-x": (-1.0, 0.0, 0.0),
+        "+y": (0.0, 1.0, 0.0),
+        "-y": (0.0, -1.0, 0.0),
+        "+z": (0.0, 0.0, 1.0),
+        "-z": (0.0, 0.0, -1.0),
     }
-    return axis_vectors[axis]
+    return mo.asarray(axis_vectors[axis])
 
 
-def _compute_approach_frame_rotation(approach_axis: str, grasp_axis: str) -> np.ndarray:
+def _compute_approach_frame_rotation(approach_axis: str, grasp_axis: str) -> Any:
     """
     Compute the rotation matrix from object frame to approach frame.
 
@@ -59,8 +57,8 @@ def _compute_approach_frame_rotation(approach_axis: str, grasp_axis: str) -> np.
     obj_grasp = _axis_string_to_vector(grasp_axis)        # Maps to +Y
     
     # Compute up axis using right-hand rule: Z = X × Y
-    obj_up = np.cross(obj_approach, obj_grasp)
-    obj_up = obj_up / np.linalg.norm(obj_up)  # Normalize
+    obj_up = mo.cross(obj_approach, obj_grasp)
+    obj_up = obj_up / mo.norm(obj_up)  # Normalize
 
     # Build rotation matrix
     # The rows of R are where each approach-frame axis comes from in object frame
@@ -68,7 +66,7 @@ def _compute_approach_frame_rotation(approach_axis: str, grasp_axis: str) -> np.
     # Approach X (forward) <- obj_approach
     # Approach Y (grasp)   <- obj_grasp
     # Approach Z (up)      <- obj_up
-    R = np.vstack([obj_approach, obj_grasp, obj_up])
+    R = mo.vstack([obj_approach, obj_grasp, obj_up])
     return R
 
 
@@ -114,7 +112,7 @@ class TargetObject:
         self._grasp_config = grasp_config
         
         # Pre-compute rotation matrix if approach frame is set (via grasp_config.target_frame)
-        self._approach_rotation: Optional[np.ndarray] = None
+        self._approach_rotation: Optional[Any] = None
         if grasp_config is not None and grasp_config.target_frame is not None:
             self._approach_rotation = _compute_approach_frame_rotation(
                 grasp_config.target_frame.approach_axis,
@@ -148,16 +146,17 @@ class TargetObject:
             return None
         return self._grasp_config.target_frame
 
-    def get_raw_world_pose(self) -> Tuple[np.ndarray, np.ndarray]:
+    def get_raw_world_pose(self) -> Tuple[Any, Any]:
         """Get the object's world pose in its native frame (no transformation).
 
         Returns:
             A tuple (position, orientation) where position is a 3D vector
             and orientation is a quaternion in wxyz format.
+            Backend depends on SimulationContext (numpy ndarray or torch Tensor).
         """
         return self._xform.get_world_pose()
 
-    def get_world_pose(self) -> Tuple[np.ndarray, np.ndarray]:
+    def get_world_pose(self) -> Tuple[Any, Any]:
         """Get the object's world pose (with approach frame transformation if set).
 
         If an approach_frame is configured, the returned orientation is
@@ -169,6 +168,7 @@ class TargetObject:
         Returns:
             A tuple (position, orientation) where position is a 3D vector
             and orientation is a quaternion in wxyz format.
+            Backend depends on SimulationContext (numpy ndarray or torch Tensor).
         """
         position, orientation = self._xform.get_world_pose()
         
@@ -179,10 +179,10 @@ class TargetObject:
         # R_world_object = rotation from object frame to world frame
         # R_approach = rotation from object frame to approach frame
         # R_world_approach = R_world_object @ R_approach^T
-        R_world_object = quat_to_rot_matrix(orientation)
+        R_world_object = mo.quat_to_rot_matrix(orientation)
         R_world_approach = R_world_object @ self._approach_rotation.T
         
-        new_orientation = rot_matrix_to_quat(R_world_approach)
+        new_orientation = mo.rot_matrix_to_quat(R_world_approach)
         
         return position, new_orientation
 
@@ -201,14 +201,14 @@ class TargetObject:
         """
         self._xform.set_world_pose(position, orientation)
 
-    def get_transform(self) -> np.ndarray:
+    def get_transform(self) -> Any:
         """Get the object's world pose as a 4x4 homogeneous transformation matrix.
 
         If an approach frame is configured, the returned matrix uses the
         transformed orientation.
 
         Returns:
-            A 4x4 numpy array representing the homogeneous transformation matrix.
+            A 4x4 array/tensor representing the homogeneous transformation matrix.
         """
         position, orientation = self.get_world_pose()
         pose = PosePq(position, orientation)
@@ -255,16 +255,16 @@ class TargetObject:
             )
         
         position, orientation = self.get_world_pose()
-        R = quat_to_rot_matrix(orientation)
+        R = mo.quat_to_rot_matrix(orientation)
 
         # Left handle: +Y offset in approach frame
-        left_offset_local = np.array([
+        left_offset_local = mo.asarray([
             self._grasp_config.handle_x_offset,
             self._grasp_config.handle_y_offset,
             0.0,
         ])
         # Right handle: -Y offset in approach frame
-        right_offset_local = np.array([
+        right_offset_local = mo.asarray([
             self._grasp_config.handle_x_offset,
             -self._grasp_config.handle_y_offset,
             0.0,
@@ -274,13 +274,7 @@ class TargetObject:
         right_handle_pos = position + R @ right_offset_local
 
         # Both handles share the same orientation as the object
-        left_pose = PosePq(
-            np.asarray(left_handle_pos, dtype=float),
-            np.asarray(orientation, dtype=float),
-        )
-        right_pose = PosePq(
-            np.asarray(right_handle_pos, dtype=float),
-            np.asarray(orientation, dtype=float),
-        )
+        left_pose = PosePq(left_handle_pos, orientation)
+        right_pose = PosePq(right_handle_pos, orientation)
 
         return left_pose, right_pose

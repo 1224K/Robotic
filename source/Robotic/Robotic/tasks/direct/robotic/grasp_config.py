@@ -23,9 +23,9 @@ Example:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, List, Optional, Tuple
 
-import numpy as np
+from .array_backend import mathops as mo
 
 
 __all__ = ["PosePq", "ApproachFrameConfig", "GraspDetectionConfig"]
@@ -44,8 +44,8 @@ class PosePq:
     requiring Cortex framework dependencies.
 
     Attributes:
-        p: 3D position vector (x, y, z).
-        q: Quaternion in wxyz format (w, x, y, z).
+        p: 3D position vector (x, y, z), backend array/tensor.
+        q: Quaternion in wxyz format (w, x, y, z), backend array/tensor.
 
     Example:
         >>> pose = PosePq(
@@ -56,41 +56,24 @@ class PosePq:
         >>> print(f"Position: {pose.p}, Orientation: {pose.q}")
     """
 
-    p: np.ndarray  # 3D position
-    q: np.ndarray  # quaternion (wxyz)
-
+    p: Any  # 3D position
+    q: Any  # quaternion (wxyz)
     def __post_init__(self) -> None:
-        """Ensure arrays are proper numpy arrays."""
-        self.p = np.asarray(self.p, dtype=float).reshape(3)
-        self.q = np.asarray(self.q, dtype=float).reshape(4)
+        """Ensure arrays use the configured backend."""
+        self.p = mo.asarray(self.p).reshape(3)
+        self.q = mo.asarray(self.q).reshape(4)
 
-    def to_T(self) -> np.ndarray:
+    def to_T(self) -> Any:
         """
         Convert pose to 4x4 homogeneous transformation matrix.
 
         Returns:
-            4x4 numpy array representing the transformation matrix.
+            4x4 array/tensor representing the transformation matrix.
         """
-        # Extract quaternion components (wxyz format)
-        w, x, y, z = self.q
-
-        # Compute rotation matrix from quaternion
-        # Using the standard quaternion to rotation matrix formula
-        xx, yy, zz = x * x, y * y, z * z
-        xy, xz, yz = x * y, x * z, y * z
-        wx, wy, wz = w * x, w * y, w * z
-
-        R = np.array([
-            [1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy)],
-            [2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx)],
-            [2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)],
-        ], dtype=float)
-
-        # Build 4x4 transformation matrix
-        T = np.eye(4, dtype=float)
+        R = mo.quat_to_rot_matrix(self.q)
+        T = mo.eye(4)
         T[:3, :3] = R
         T[:3, 3] = self.p
-
         return T
 
 
@@ -177,6 +160,7 @@ class GraspDetectionConfig:
     1. Grasp detection thresholds (gripper joint position range, grasp zone distance)
     2. Target object frame alignment settings (via nested ApproachFrameConfig)
     3. Fan handle geometry for virtual handle TCP positions
+    4. Project prim path defaults
 
     The target_frame attribute defines how to transform the target object's
     coordinate frame to align with the end-effector convention. If None,
@@ -213,6 +197,22 @@ class GraspDetectionConfig:
         handle_x_offset: Offset along approach axis X (meters).
                          Positive = in front of object center.
                          Default -0.015m.
+        hold_confirm_frames: Number of consecutive frames that must satisfy the
+                             instantaneous grasp conditions before reporting
+                             holding. Frame-based only (no dt conversion).
+                             Default 10.
+        robot_prim_path: Default robot prim path for this project.
+        fan_prim_path: Default fan prim path for this project.
+        ground_truth_prim_path: Default ground truth prim path for this project.
+        cabinet_prim_path: Default cabinet prim path for this project.
+        collision_whitelist_not_holding: Collision whitelist rules when not holding.
+                                         Each rule is a tuple of full path prefixes.
+                                         Defaults to ignore fan <-> cabinet.
+                                         Set to None or [] to disable the whitelist.
+        collision_whitelist_holding: Collision whitelist rules when holding.
+                                     Each rule is a tuple of full path prefixes.
+                                     Defaults to ignore robot <-> fan.
+                                     Set to None or [] to disable the whitelist.
 
     Example:
         >>> # Config for fan with custom grasp zone and handle offsets
@@ -231,6 +231,36 @@ class GraspDetectionConfig:
     target_frame: Optional[ApproachFrameConfig] = field(default_factory=ApproachFrameConfig)
     handle_y_offset: float = 0.1
     handle_x_offset: float = -0.015
+    hold_confirm_frames: int = 10
+    robot_prim_path: Optional[str] = "/World/WorkSpace/RS_M90E7A_Left"
+    fan_prim_path: Optional[str] = "/World/WorkSpace/Scene0903/Scene0903/tn__02_1_j8und3wXW0fz9/tn__FANASSY_RIGHT1_nEwC"
+    ground_truth_prim_path: Optional[str] = "/World/WorkSpace/Scene0903/Scene0903/tn__01_1_j8icW3fhh0lW6cS/tn__FANASSY_RIGHT1_nEwC"
+    cabinet_prim_path: Optional[str] = "/World/WorkSpace/Scene0903/Scene0903/tn__01_1_j8icW3fhh0lW6cS"
+    collision_whitelist_not_holding: Optional[List[Tuple[str, ...]]] = None
+    collision_whitelist_holding: Optional[List[Tuple[str, ...]]] = None
+
+    def __post_init__(self) -> None:
+        """
+        Populate whitelist defaults from prim paths when not explicitly provided.
+
+        - None means "auto": derive default rules from prim paths.
+        - [] means "disable whitelist": report all collisions.
+        """
+        if self.collision_whitelist_not_holding is None:
+            if self.cabinet_prim_path and self.fan_prim_path:
+                self.collision_whitelist_not_holding = [
+                    (self.cabinet_prim_path, self.fan_prim_path)
+                ]
+            else:
+                self.collision_whitelist_not_holding = None
+
+        if self.collision_whitelist_holding is None:
+            if self.robot_prim_path and self.fan_prim_path:
+                self.collision_whitelist_holding = [
+                    (self.robot_prim_path, self.fan_prim_path)
+                ]
+            else:
+                self.collision_whitelist_holding = None
 
     # -----------------------------------------------------------------------
     # Convenience properties for axis access
@@ -290,8 +320,3 @@ class GraspDetectionConfig:
                 grasp_axis=value,
             )
 
-    def __post_init__(self) -> None:
-        """Handle initialization with axis parameters."""
-        # This is handled by the setters when users pass axis values
-        # directly to __init__ via **kwargs pattern
-        pass

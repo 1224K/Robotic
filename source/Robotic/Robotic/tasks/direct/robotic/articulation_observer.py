@@ -10,23 +10,11 @@ and gripper state without any motion control functionality.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
-import numpy as np
-from isaacsim.core.prims import SingleArticulation
-from isaacsim.core.utils.rotations import quat_to_rot_matrix, rot_matrix_to_quat
+from isaacsim.core.prims import SingleArticulation, SingleXFormPrim
 
-from isaacsim.core.utils.extensions import enable_extension
-enable_extension("omni.isaac.motion_generation")
-
-try:
-    # 新版（你原本寫的，但你這套沒有）
-    from isaacsim.robot_motion.motion_generation import LulaKinematicsSolver
-except ModuleNotFoundError:
-    # 很多 Isaac Sim 版本實際是在這裡（OmniIsaac）
-    from omni.isaac.motion_generation import LulaKinematicsSolver
-
+from .array_backend import mathops as mo
 from .grasp_config import PosePq
 
 
@@ -45,7 +33,8 @@ class RobotJointConfig:
     Attributes:
         arm_joint_names: Names of the arm joints (in order).
         gripper_joint_names: Names of the gripper joints.
-        end_effector_frame_name: Name of the end-effector frame in URDF.
+        end_effector_prim_suffix: Rail prim path suffix from robot root.
+        end_effector_offset: End-effector offset from rail in rail local frame.
         left_finger_y_offset: Left finger offset from EE along local Y-axis.
         right_finger_y_offset: Right finger offset from EE along local Y-axis.
     """
@@ -63,23 +52,10 @@ class RobotJointConfig:
         "Slider9",
         "Slider10",
     ))
-    end_effector_frame_name: str = "gripper_center"
+    end_effector_prim_suffix: str = "TF_1/gripper_base_2/rail_2"
+    end_effector_offset: Sequence[float] = field(default_factory=lambda: (0.06, 0.0, 0.0))
     left_finger_y_offset: float = 0.075
     right_finger_y_offset: float = -0.075
-
-
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
-
-def _resolve_path(path_str: str, label: str) -> str:
-    """Resolve and validate a file path."""
-    if not path_str:
-        raise ValueError(f"{label} cannot be empty.")
-    resolved = Path(path_str).expanduser().resolve()
-    if not resolved.exists():
-        raise FileNotFoundError(f"{label} not found: {resolved}")
-    return str(resolved)
 
 
 # ---------------------------------------------------------------------------
@@ -92,23 +68,19 @@ class ArticulationObserver:
 
     This class wraps a SingleArticulation to provide read-only access to:
     - Joint positions and velocities (full, arm subset, gripper subset)
-    - End-effector pose via forward kinematics
+    - End-effector pose via a rail prim in world space
     - Gripper finger positions and width
 
     No motion control or commanding functionality is included.
 
     Args:
         prim_path: The USD prim path of the robot articulation.
-        robot_description_path: Path to the robot description YAML file for Lula.
-        urdf_path: Path to the robot URDF file.
         joint_config: Robot joint configuration. If None, uses default RobotJointConfig.
         name: Optional friendly name for logging.
 
     Example:
         >>> observer = ArticulationObserver(
         ...     prim_path="/World/Robot",
-        ...     robot_description_path="path/to/robot_description.yaml",
-        ...     urdf_path="path/to/robot.urdf",
         ... )
         >>> observer.initialize()
         >>> ee_pose = observer.get_end_effector_pose()
@@ -118,17 +90,11 @@ class ArticulationObserver:
     def __init__(
         self,
         prim_path: str,
-        robot_description_path: str,
-        urdf_path: str,
         joint_config: Optional[RobotJointConfig] = None,
         name: Optional[str] = None,
     ) -> None:
         self._prim_path = prim_path
         self._name = name or prim_path.rsplit("/", 1)[-1]
-
-        # Store paths
-        self._robot_description_path = robot_description_path
-        self._urdf_path = urdf_path
 
         # Use provided config or defaults
         self._config = joint_config or RobotJointConfig()
@@ -139,8 +105,9 @@ class ArticulationObserver:
             name=self._name,
         )
 
-        # Kinematics solver (initialized later)
-        self._kinematics_solver: Optional[LulaKinematicsSolver] = None
+        # End-effector rail prim (initialized later)
+        self._ee_rail_prim_path: Optional[str] = None
+        self._ee_rail_xform: Optional[SingleXFormPrim] = None
 
         # Joint index caches (populated after initialize)
         self._arm_joint_indices: Optional[List[int]] = None
@@ -202,7 +169,7 @@ class ArticulationObserver:
         This must be called after the simulation has started and the
         articulation is valid. It sets up:
         - The underlying articulation
-        - The kinematics solver with robot base pose
+        - The end-effector rail prim wrapper
         - Joint index caches for arm and gripper subsets
 
         Args:
@@ -235,86 +202,47 @@ class ArticulationObserver:
         print(f"[{self._name}] Arm joint indices: {self._arm_joint_indices}")
         print(f"[{self._name}] Gripper joint indices: {self._gripper_joint_indices}")
 
-        # Initialize kinematics solver
-        robot_desc_path = _resolve_path(self._robot_description_path, "robot_description_path")
-        urdf_path = _resolve_path(self._urdf_path, "urdf_path")
-
-        self._kinematics_solver = LulaKinematicsSolver(
-            robot_description_path=robot_desc_path,
-            urdf_path=urdf_path,
-        )
-
-        # Set robot base pose for FK calculations
-        position, orientation = self._articulation.get_world_pose()
-        print(f"[{self._name}] Base position: {position}, orientation: {orientation}")
-
-        def _to_cpu_numpy(x):
-            import numpy as np
-            import torch
-            if isinstance(x, torch.Tensor):
-                x = x.detach().cpu().numpy()
-            return np.asarray(x)
-
-        position = _to_cpu_numpy(position).reshape(3,)
-        orientation = _to_cpu_numpy(orientation).reshape(4,)
-
-        self._kinematics_solver.set_robot_base_pose(
-            robot_position=position,
-            robot_orientation=orientation,
+        ee_suffix = str(self._config.end_effector_prim_suffix).strip("/")
+        if not ee_suffix:
+            raise ValueError("end_effector_prim_suffix cannot be empty.")
+        root_path = self._prim_path.rstrip("/")
+        self._ee_rail_prim_path = f"{root_path}/{ee_suffix}"
+        self._ee_rail_xform = SingleXFormPrim(
+            prim_path=self._ee_rail_prim_path,
+            name=f"{self._name}_ee_rail",
         )
 
         self._initialized = True
         print(f"[{self._name}] ArticulationObserver initialized successfully")
 
-    def update_robot_base_pose(self) -> None:
-        """
-        Update the kinematics solver with the current robot base pose.
-
-        Call this if the robot base has moved since initialization.
-        """
-        if not self._initialized or self._kinematics_solver is None:
-            raise RuntimeError("ArticulationObserver not initialized. Call initialize() first.")
-
-        position, orientation = self._articulation.get_world_pose()
-        self._kinematics_solver.set_robot_base_pose(
-            robot_position=position,
-            robot_orientation=orientation,
-        )
 
     # -----------------------------------------------------------------------
     # Joint state access
     # -----------------------------------------------------------------------
 
-    def get_joint_positions(self) -> np.ndarray:
+    def get_joint_positions(self) -> Any:
         """Get all joint positions."""
         return self._articulation.get_joint_positions()
 
-    def get_joint_velocities(self) -> np.ndarray:
+    def get_joint_velocities(self) -> Any:
         """Get all joint velocities."""
         return self._articulation.get_joint_velocities()
 
-    def get_arm_joint_positions(self) -> np.ndarray:
+    def get_arm_joint_positions(self) -> Any:
         """Get arm joint positions (7-DOF)."""
         if self._arm_joint_indices is None:
             raise RuntimeError("ArticulationObserver not initialized. Call initialize() first.")
         all_positions = self._articulation.get_joint_positions()
-        # return np.array([all_positions[i] for i in self._arm_joint_indices], dtype=float)
-        return (
-            all_positions[self._arm_joint_indices]
-            .detach()
-            .cpu()
-            .numpy()
-            .astype(float)
-        )
+        return all_positions[self._arm_joint_indices]
 
-    def get_arm_joint_velocities(self) -> np.ndarray:
+    def get_arm_joint_velocities(self) -> Any:
         """Get arm joint velocities (7-DOF)."""
         if self._arm_joint_indices is None:
             raise RuntimeError("ArticulationObserver not initialized. Call initialize() first.")
         all_velocities = self._articulation.get_joint_velocities()
-        return np.array([all_velocities[i] for i in self._arm_joint_indices], dtype=float)
+        return all_velocities[self._arm_joint_indices]
 
-    def get_gripper_joint_positions(self) -> np.ndarray:
+    def get_gripper_joint_positions(self) -> Any:
         """
         Get gripper joint positions.
 
@@ -326,64 +254,58 @@ class ArticulationObserver:
         if self._gripper_joint_indices is None:
             raise RuntimeError("ArticulationObserver not initialized. Call initialize() first.")
         all_positions = self._articulation.get_joint_positions()
-        return np.array([all_positions[i] for i in self._gripper_joint_indices], dtype=float)
+        return all_positions[self._gripper_joint_indices]
 
-    def get_gripper_joint_velocities(self) -> np.ndarray:
+    def get_gripper_joint_velocities(self) -> Any:
         """Get gripper joint velocities."""
         if self._gripper_joint_indices is None:
             raise RuntimeError("ArticulationObserver not initialized. Call initialize() first.")
         all_velocities = self._articulation.get_joint_velocities()
-        return np.array([all_velocities[i] for i in self._gripper_joint_indices], dtype=float)
+        return all_velocities[self._gripper_joint_indices]
 
     # -----------------------------------------------------------------------
-    # Forward Kinematics
+    # End-effector pose
     # -----------------------------------------------------------------------
 
     def get_end_effector_pose(
         self,
-        config: Optional[np.ndarray] = None,
+        config: Optional[Any] = None,
     ) -> PosePq:
         """
-        Get the end-effector pose via forward kinematics.
+        Get the end-effector pose from the rail prim in world space.
 
         Args:
-            config: Optional arm joint configuration (7-DOF). If None, uses
-                current arm joint positions.
+            config: Unused. Present for API compatibility.
 
         Returns:
             PosePq with:
             - p: 3D position in world frame
             - q: quaternion in wxyz format
         """
-        if self._kinematics_solver is None:
+        if self._ee_rail_xform is None:
             raise RuntimeError("ArticulationObserver not initialized. Call initialize() first.")
 
-        if config is None:
-            config = self.get_arm_joint_positions()
+        rail_pos, rail_quat = self._ee_rail_xform.get_world_pose()
+        rail_rot = mo.quat_to_rot_matrix(rail_quat)
 
-        position, rotation = self._kinematics_solver.compute_forward_kinematics(
-            frame_name=self._config.end_effector_frame_name,
-            joint_positions=config,
-        )
-        ee_quat = rot_matrix_to_quat(rotation)
-        return PosePq(
-            np.asarray(position, dtype=float),
-            np.asarray(ee_quat, dtype=float),
-        )
+        offset = mo.asarray(self._config.end_effector_offset)
+        ee_pos = rail_pos + rail_rot @ offset
+        ee_quat = rail_quat
+        return PosePq(ee_pos, ee_quat)
 
     def get_finger_poses(
         self,
-        config: Optional[np.ndarray] = None,
+        config: Optional[Any] = None,
     ) -> Tuple[PosePq, PosePq]:
         """
         Get both finger poses as PosePq objects.
 
-        Since the gripper sliders are not in the FK cspace, we compute the
-        end-effector pose and apply the finger offsets along the local Y-axis.
+        Since the gripper sliders are not part of the rail prim pose, we
+        compute the end-effector pose and apply the finger offsets along
+        the local Y-axis.
 
         Args:
-            config: Optional arm joint configuration (7-DOF). If None, uses
-                current arm joint positions.
+            config: Unused. Present for API compatibility.
 
         Returns:
             Tuple of (left_finger_pose, right_finger_pose) in world frame.
@@ -398,7 +320,7 @@ class ArticulationObserver:
         """
         ee_pose = self.get_end_effector_pose(config)
         ee_pos = ee_pose.p
-        ee_rot = quat_to_rot_matrix(ee_pose.q)
+        ee_rot = mo.quat_to_rot_matrix(ee_pose.q)
 
         # Get current slider positions
         gripper_pos = self.get_gripper_joint_positions()
@@ -407,26 +329,27 @@ class ArticulationObserver:
 
         # Left finger offset in local frame: Y = base_offset - slider_position
         # (slider moves in -Y direction according to URDF axis)
-        left_local_offset = np.array([0.0, self._config.left_finger_y_offset - left_slider_pos, 0.0])
+        y_axis = mo.asarray([0.0, 1.0, 0.0])
+        left_local_offset = (
+            mo.asarray([0.0, self._config.left_finger_y_offset, 0.0])
+            - y_axis * left_slider_pos
+        )
         left_world_offset = ee_rot @ left_local_offset
         left_finger_pos = ee_pos + left_world_offset
 
         # Right finger offset in local frame
-        right_local_offset = np.array([0.0, self._config.right_finger_y_offset - right_slider_pos, 0.0])
+        right_local_offset = (
+            mo.asarray([0.0, self._config.right_finger_y_offset, 0.0])
+            - y_axis * right_slider_pos
+        )
         right_world_offset = ee_rot @ right_local_offset
         right_finger_pos = ee_pos + right_world_offset
 
         # Convert rotation matrix to quaternion (wxyz format)
-        ee_quat = rot_matrix_to_quat(ee_rot)
+        ee_quat = mo.rot_matrix_to_quat(ee_rot)
 
-        left_pose = PosePq(
-            np.asarray(left_finger_pos, dtype=float),
-            np.asarray(ee_quat, dtype=float),
-        )
-        right_pose = PosePq(
-            np.asarray(right_finger_pos, dtype=float),
-            np.asarray(ee_quat, dtype=float),
-        )
+        left_pose = PosePq(left_finger_pos, ee_quat)
+        right_pose = PosePq(right_finger_pos, ee_quat)
 
         return left_pose, right_pose
 
@@ -434,11 +357,12 @@ class ArticulationObserver:
     # World pose access
     # -----------------------------------------------------------------------
 
-    def get_world_pose(self) -> Tuple[np.ndarray, np.ndarray]:
+    def get_world_pose(self) -> Tuple[Any, Any]:
         """
         Get the robot base world pose.
 
         Returns:
             Tuple of (position, orientation) where orientation is quaternion (wxyz).
+            Backend depends on SimulationContext (numpy ndarray or torch Tensor).
         """
-        return self._articulation.get_world_pose().detach().cpu().numpy()
+        return self._articulation.get_world_pose()
