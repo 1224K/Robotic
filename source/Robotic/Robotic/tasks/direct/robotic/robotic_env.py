@@ -169,6 +169,9 @@ class RoboticEnv(DirectRLEnv):
         self.ee_pos  = ee_p - self.scene.env_origins
         self.ee_quat = ee_q
 
+        print("EE位置:", self.ee_pos)
+        print("EE四元數:", self.ee_quat)
+
         self.fan_pos  = self.fan.data.root_pos_w - self.scene.env_origins
         self.fan_quat = self.fan.data.root_quat_w
 
@@ -271,7 +274,7 @@ class RoboticEnv(DirectRLEnv):
         p4 = self.robot.data.body_pos_w[:, i4]
         finger_pos = 0.5 * (p3 + p4) - self.scene.env_origins
         rel = finger_pos - self.fan_pos
-        print("fingers-距離獎勵:", rel)
+        # print("fingers-距離獎勵:", rel)
 
         ## use monitor EE directly
         r_reach_list = []
@@ -279,7 +282,7 @@ class RoboticEnv(DirectRLEnv):
             error = mon.get_ee_to_fan_error()
             r_reach_list.append(-torch.as_tensor(error.distance, device=self.device, dtype=torch.float32))
         r_reach = torch.stack(r_reach_list, dim=0)   # (N,)
-        print("monitor-距離獎勵:", r_reach)
+        # print("monitor-距離獎勵:", r_reach)
 
         # === 2) 夾緊成功 ===
         # close_ok = (self.gripper_gap < self.cfg.grasp_width_close_threshold)
@@ -323,6 +326,7 @@ class RoboticEnv(DirectRLEnv):
         if not self.monitor_initized:
             for mon in self.monitor:
                 mon.initialize()
+            print("PoseMonitor initialized.")
             self.monitor_initized = True
 
         # set the root state for the reset envs
