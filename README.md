@@ -112,11 +112,10 @@
 
   | Name       | formula                           | scale | Description                                                 |
   | ---------- | --------------------------------- | ----- | ----------------------------------------------------------- |
-  | r_reach    |  -\|\|ee_pos - fan_pos\|\|        | 1     | Distance error between the end-effector gripper and the fan |
+  | r_reach    |  \|\|ee_pos - fan_pos\|\|         | -1    | Distance error between the end-effector gripper and the fan |
 
 - Success Matrix
 
   | Name       | formula                           | Description                                                 |
   | ---------- | --------------------------------- | ----------------------------------------------------------- |
   | s_reach    |  \|\|ee_pos - fan_pos\|\| < 0.15  | Whether the end-effector gripper is close enough to the fan |
-  
