@@ -33,8 +33,8 @@ class RobotJointConfig:
     Attributes:
         arm_joint_names: Names of the arm joints (in order).
         gripper_joint_names: Names of the gripper joints.
-        end_effector_prim_suffix: Rail prim path suffix from robot root.
-        end_effector_offset: End-effector offset from rail in rail local frame.
+        end_effector_tf1_prim_suffix: TF_1 prim path suffix from robot root.
+        tf1_to_grasp_center_offset: Fixed offset from TF_1 to grasp center in TF_1 local frame.
         left_finger_y_offset: Left finger offset from EE along local Y-axis.
         right_finger_y_offset: Right finger offset from EE along local Y-axis.
     """
@@ -52,8 +52,10 @@ class RobotJointConfig:
         "Slider9",
         "Slider10",
     ))
-    end_effector_prim_suffix: str = "TF_1/gripper_base_2/rail_2"
-    end_effector_offset: Sequence[float] = field(default_factory=lambda: (0.06, 0.0, 0.0))
+    end_effector_tf1_prim_suffix: str = "TF_1"
+    tf1_to_grasp_center_offset: Sequence[float] = field(
+        default_factory=lambda: (0.118, 0.0, -0.003)
+    )
     left_finger_y_offset: float = 0.075
     right_finger_y_offset: float = -0.075
 
@@ -68,7 +70,7 @@ class ArticulationObserver:
 
     This class wraps a SingleArticulation to provide read-only access to:
     - Joint positions and velocities (full, arm subset, gripper subset)
-    - End-effector pose via a rail prim in world space
+    - End-effector pose via TF_1 with a fixed grasp center offset
     - Gripper finger positions and width
 
     No motion control or commanding functionality is included.
@@ -105,9 +107,9 @@ class ArticulationObserver:
             name=self._name,
         )
 
-        # End-effector rail prim (initialized later)
-        self._ee_rail_prim_path: Optional[str] = None
-        self._ee_rail_xform: Optional[SingleXFormPrim] = None
+        # End-effector TF_1 prim (initialized later)
+        self._ee_tf1_prim_path: Optional[str] = None
+        self._ee_tf1_xform: Optional[SingleXFormPrim] = None
 
         # Joint index caches (populated after initialize)
         self._arm_joint_indices: Optional[List[int]] = None
@@ -169,7 +171,7 @@ class ArticulationObserver:
         This must be called after the simulation has started and the
         articulation is valid. It sets up:
         - The underlying articulation
-        - The end-effector rail prim wrapper
+        - The end-effector TF_1 prim wrapper
         - Joint index caches for arm and gripper subsets
 
         Args:
@@ -202,14 +204,14 @@ class ArticulationObserver:
         print(f"[{self._name}] Arm joint indices: {self._arm_joint_indices}")
         print(f"[{self._name}] Gripper joint indices: {self._gripper_joint_indices}")
 
-        ee_suffix = str(self._config.end_effector_prim_suffix).strip("/")
-        if not ee_suffix:
-            raise ValueError("end_effector_prim_suffix cannot be empty.")
         root_path = self._prim_path.rstrip("/")
-        self._ee_rail_prim_path = f"{root_path}/{ee_suffix}"
-        self._ee_rail_xform = SingleXFormPrim(
-            prim_path=self._ee_rail_prim_path,
-            name=f"{self._name}_ee_rail",
+        tf1_suffix = str(self._config.end_effector_tf1_prim_suffix).strip("/")
+        if not tf1_suffix:
+            raise ValueError("end_effector_tf1_prim_suffix cannot be empty.")
+        self._ee_tf1_prim_path = f"{root_path}/{tf1_suffix}"
+        self._ee_tf1_xform = SingleXFormPrim(
+            prim_path=self._ee_tf1_prim_path,
+            name=f"{self._name}_ee_tf1",
         )
 
         self._initialized = True
@@ -272,7 +274,7 @@ class ArticulationObserver:
         config: Optional[Any] = None,
     ) -> PosePq:
         """
-        Get the end-effector pose from the rail prim in world space.
+        Get the end-effector pose from TF_1 with a fixed grasp center offset.
 
         Args:
             config: Unused. Present for API compatibility.
@@ -282,16 +284,15 @@ class ArticulationObserver:
             - p: 3D position in world frame
             - q: quaternion in wxyz format
         """
-        if self._ee_rail_xform is None:
+        if self._ee_tf1_xform is None:
             raise RuntimeError("ArticulationObserver not initialized. Call initialize() first.")
 
-        rail_pos, rail_quat = self._ee_rail_xform.get_world_pose()
-        rail_rot = mo.quat_to_rot_matrix(rail_quat)
+        tf1_pos, tf1_quat = self._ee_tf1_xform.get_world_pose()
+        tf1_rot = mo.quat_to_rot_matrix(tf1_quat)
 
-        offset = mo.asarray(self._config.end_effector_offset)
-        ee_pos = rail_pos + rail_rot @ offset
-        ee_quat = rail_quat
-        return PosePq(ee_pos, ee_quat)
+        ee_offset = mo.asarray(self._config.tf1_to_grasp_center_offset)
+        ee_pos = tf1_pos + tf1_rot @ ee_offset
+        return PosePq(ee_pos, tf1_quat)
 
     def get_finger_poses(
         self,
@@ -300,7 +301,7 @@ class ArticulationObserver:
         """
         Get both finger poses as PosePq objects.
 
-        Since the gripper sliders are not part of the rail prim pose, we
+        Since the gripper sliders are not part of the end-effector pose, we
         compute the end-effector pose and apply the finger offsets along
         the local Y-axis.
 
