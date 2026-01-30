@@ -645,10 +645,12 @@ class PoseMonitor:
         fan_object = TargetObject(
             prim_path=fan_prim_path,
             grasp_config=grasp_config,
+            pose_source="physx",
         )
         ground_truth_object = TargetObject(
             prim_path=ground_truth_prim_path,
             grasp_config=grasp_config,
+            pose_source="xform",
         )
 
         # Create GraspDetectionStrategy with the config
@@ -686,6 +688,10 @@ class PoseMonitor:
             physics_sim_view: Optional physics simulation view.
         """
         self.robot_observer.initialize(physics_sim_view)
+        if self.fan_object is not None:
+            self.fan_object.initialize()
+        if self.ground_truth_object is not None:
+            self.ground_truth_object.initialize()
 
     def start_contact_events(self) -> None:
         """
