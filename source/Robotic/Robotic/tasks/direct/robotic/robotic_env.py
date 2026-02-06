@@ -40,12 +40,11 @@ class RoboticEnv(DirectRLEnv):
         self.arm_dof_ids, _ = self.robot.find_joints([f"Revolute{i}" for i in range(1, 8)])
         self.grip_dof_ids, _ = self.robot.find_joints(["Slider9", "Slider10"])
 
-        # EE delta position (meters per step) + gripper command
+        # EE delta position (meters per step) + EE delta rotation + gripper command
         ee_step = 0.003   # 3 mm / step（很穩，之後可調）
 
-        low  = np.array([-ee_step, -ee_step, -ee_step, -1.0], dtype=np.float32)
-        high = np.array([ ee_step,  ee_step,  ee_step,  1.0], dtype=np.float32)
-
+        low  = np.array([-ee_step, -ee_step, -ee_step, -1.0, -1.0, -1.0, -1.0], dtype=np.float32)
+        high = np.array([ ee_step,  ee_step,  ee_step,  1.0,  1.0,  1.0,  1.0], dtype=np.float32)
         self.action_space = spaces.Box(low=low, high=high, dtype=np.float32)
         
         names = self.robot.body_names
@@ -61,7 +60,7 @@ class RoboticEnv(DirectRLEnv):
         self._fan_spawn_local_quat = fan_world_quat.clone()                     # 世界四元數 = local（根是 env_x 原點）
 
         self.ik_cfg = DifferentialIKControllerCfg(
-            command_type="position",          
+            command_type="pose",          
             use_relative_mode=True,        
             ik_method="dls",                  # damped least squares
         )
@@ -94,6 +93,18 @@ class RoboticEnv(DirectRLEnv):
         # consecutive frames to confirm holding
         self.grasp_confirm_frames = 3
         
+        self.ee_offset_tf1 = torch.tensor([0.118, 0.0, -0.003], device=self.device, dtype=torch.float32)
+
+        approach_axis = "-y"   # EE 往 fan 的方向（approach / forward）
+        grasp_axis    = "+x"   # 夾爪張開方向（finger axis）
+
+        self.R_obj_to_approach = compute_obj_to_approach_R(
+            approach_axis=approach_axis,
+            grasp_axis=grasp_axis,
+            device=self.device,
+            dtype=torch.float32,
+        )
+
         # test
         print("dt =", self.cfg.sim.dt, "decimation =", self.cfg.decimation)
         print("episode_length_s =", self.cfg.episode_length_s)
@@ -130,8 +141,8 @@ class RoboticEnv(DirectRLEnv):
         # plate = sim_utils.UsdFileCfg(usd_path=self.cfg.plate_usd)
         # plate.func("/World/envs/env_.*/plate", plate, translation=self.cfg.plate_spawn_base)
 
-        rack = sim_utils.UsdFileCfg(usd_path=self.cfg.rack_usd)
-        rack.func("/World/envs/env_.*/rack", rack, translation=self.cfg.rack_spawn_base)
+        # rack = sim_utils.UsdFileCfg(usd_path=self.cfg.rack_usd)
+        # rack.func("/World/envs/env_.*/rack", rack, translation=self.cfg.rack_spawn_base)
 
         # clone and replicate
         self.scene.clone_environments(copy_from_source=True)
@@ -146,16 +157,16 @@ class RoboticEnv(DirectRLEnv):
         self.jacobians = None
 
         # monitor
-        self.monitor = []
-        for i in range(self.num_envs):
-            mon = PoseMonitor.create_default(
-                robot_prim_path=f"/World/envs/env_{i}/Robot/RS_M90E7A_Left",
-                fan_prim_path=f"/World/envs/env_{i}/fan",
-                ground_truth_prim_path=f"/World/envs/env_{i}/rack",
-            )
-            self.monitor.append(mon)
+        # self.monitor = []
+        # for i in range(self.num_envs):
+        #     mon = PoseMonitor.create_default(
+        #         robot_prim_path=f"/World/envs/env_{i}/Robot/RS_M90E7A_Left",
+        #         fan_prim_path=f"/World/envs/env_{i}/fan",
+        #         ground_truth_prim_path=f"/World/envs/env_{i}/rack",
+        #     )
+        #     self.monitor.append(mon)
         
-        self.monitor_initized = False
+        # self.monitor_initized = False
 
     def _init_tensors_once(self):
         self.prev_actions = torch.zeros((self.num_envs, self.action_space.shape[0]), device=self.device)
@@ -166,19 +177,26 @@ class RoboticEnv(DirectRLEnv):
         self.fan_quat= torch.zeros((self.num_envs, 4), device=self.device)
     
     def _compute_intermediate(self):
-        ## use fingers midpoint as EE
-        i3, i4 = self._finger_idx_pair
-        p3 = self.robot.data.body_pos_w[:, i3]
-        p4 = self.robot.data.body_pos_w[:, i4]
-        self.ee_pos = 0.5 * (p3 + p4) - self.scene.env_origins
-        self.ee_quat = self.robot.data.body_quat_w[:, i3]  # 任選一隻手指的四元數當 EE 四元數
-        ## use TF_1 as EE
-        # itf = self.robot.body_names.index("TF_1")
-        # self.ee_pos  = self.robot.data.body_pos_w[:, itf] - self.scene.env_origins
-        # self.ee_quat = self.robot.data.body_quat_w[:, itf]
+        itf = self.robot.body_names.index("TF_1")
+        # --- raw TF_1 pose (env-local position, world quat) ---
+        tf1_pos_local = self.robot.data.body_pos_w[:, itf] - self.scene.env_origins   # (N,3)
+        tf1_quat_wxyz = self.robot.data.body_quat_w[:, itf]                           # (N,4) assumed wxyz
+
+        # --- apply TF1->grasp_center offset in TF_1 local frame ---
+        R_tf1 = quat_to_rot_wxyz(tf1_quat_wxyz)                                       # (N,3,3)
+
+        # ensure offset dtype/device matches (in case mixed precision)
+        ee_offset = self.ee_offset_tf1.to(device=tf1_pos_local.device, dtype=tf1_pos_local.dtype)
+
+        ee_pos_local = tf1_pos_local + torch.matmul(R_tf1, ee_offset.view(1, 3, 1)).squeeze(-1)
+
+        # --- publish "EE pose" consistent with PoseMonitor ---
+        self.ee_pos = ee_pos_local
+        self.ee_quat = tf1_quat_wxyz  # IMPORTANT: monitor keeps TF_1 orientation (no rotation offset)
 
         # print("TF_1 EE位置:", self.ee_pos)
         # print("手指中點位置:", self.finger_pos)
+
         ## use monitor to get more accurate EE pos
         # ee_p_list = []
         # ee_q_list = []
@@ -263,19 +281,14 @@ class RoboticEnv(DirectRLEnv):
         self.actions = actions.clone()
 
     def _apply_action(self) -> None:
-        # ---- 0) actions shape -> (N,4) ----
         actions = self.actions
         if actions.dim() == 3:
             actions = actions[:, 0, :]
-        assert actions.shape[-1] == 4, f"Expected action dim=4 (Δx,Δy,Δz,g), got {actions.shape}"
+        assert actions.shape[-1] == 7, f"Expected action dim=7 (Δx,Δy,Δz,Δrx,Δry,Δrz,g), got {actions.shape}"
 
         # ---- 2) split ----
-        ee_delta = actions[:, :3]     # (N,3)
-        g_cmd    = actions[:, 3]      # (N,)
-
-        # ---- 3) clamp EE step (safety) ----
-        ee_step = 0.003
-        ee_delta = torch.clamp(ee_delta, -ee_step, ee_step)
+        ee_cmd = actions[:, :6]     # (N,3)
+        g_cmd    = actions[:, 6]      # (N,)
 
         # ---- 4) update current EE pose ----
         self._compute_intermediate()
@@ -285,23 +298,29 @@ class RoboticEnv(DirectRLEnv):
 
         # ---- 5) IK command (relative) ----
         # Requires cfg.command_type="position" and cfg.use_relative_mode=True
-        self.ik_controller.set_command(ee_delta, ee_pos=ee_pos, ee_quat=ee_quat)
+        self.ik_controller.set_command(ee_cmd, ee_pos=ee_pos, ee_quat=ee_quat)
 
         # ---- 6) compute arm joint velocities ----
         q_arm = self.robot.data.joint_pos[:, self.arm_dof_ids]   # (N,7)
         J = self.jacobians                         # (N,6,7) for the SAME EE link as ee_pos/quat
 
-        qd_arm = self.ik_controller.compute(
+        q_des = self.ik_controller.compute(
             jacobian=J,
             joint_pos=q_arm,
             ee_pos=ee_pos,
             ee_quat=ee_quat,
         )  # -> (N,7)
 
-        # ---- 7) assemble full joint velocity target (7 arm + 2 gripper) ----
-        joint_vels = torch.zeros_like(self.robot.data.joint_pos)  # (N,9)
+        # ---- 7) assemble full joint velocity target ----
+        joint_vels = torch.zeros(
+            (self.num_envs, len(self.arm_dof_ids) + len(self.grip_dof_ids)),
+            device=self.device,
+            dtype=torch.float32,
+        )
 
         # arm
+        dt = self.cfg.sim.dt * self.cfg.decimation
+        qd_arm = (q_des - q_arm) / dt
         joint_vels[:, self.arm_dof_ids] = qd_arm
 
         # gripper: map g_cmd (-1..1) -> slider speed (m/s)
@@ -318,14 +337,13 @@ class RoboticEnv(DirectRLEnv):
         self._compute_intermediate()
 
         rel_pos = self.ee_pos - self.fan_pos
-        # 只用相對位置 + EE 四元數 + fan 四元數 + gripper gap + prev action，簡潔即可
         obs_list = [
-            rel_pos,                    # 3
+            self.ee_pos,                # 3
             self.ee_quat,               # 4
-            self.fan_quat,              # 4
             self.fan_pos,               # 3
+            self.fan_quat,              # 4
             self.gripper_gap.unsqueeze(-1),  # 1
-            self.prev_actions           # 4
+            self.prev_actions           # 7
         ]
         obs = torch.cat(obs_list, dim=-1)  # 維度 = 3+4+4+3+1+4 = 19
         self.cfg.observation_space = obs.shape[-1]  # 動態校正
@@ -341,23 +359,30 @@ class RoboticEnv(DirectRLEnv):
         # print("距離獎勵:", r_reach)
 
         # === 角度 ===
-        # 用四元數差異來計算角度差異
-        q_diff = quat_mul(quat_conj(self.ee_quat), self.fan_quat)
-        angle_diff = 2.0 * torch.acos(
-            torch.clamp(q_diff[..., 0].abs(), max=1.0)
-        )
-        r_angle = -angle_diff
+        R_ee  = quat_to_rot_wxyz(self.ee_quat)     # world<-ee(TF_1)
+        R_fan = quat_to_rot_wxyz(self.fan_quat)    # world<-fan(object)
+
+        # world<-fan_approach = world<-fan_object @ object<-approach
+        R_fan_app = R_fan @ self.R_obj_to_approach.T
+
+        # angle between EE and fan_approach
+        trace = R_ee.transpose(-1, -2) @ R_fan_app
+        tr = trace[..., 0, 0] + trace[..., 1, 1] + trace[..., 2, 2]
+        c = torch.clamp((tr - 1.0) * 0.5, -1.0, 1.0)
+        ang = torch.acos(c)
+
+        r_angle = -0.5 * ang
         # print("角度獎勵:", r_angle)
 
         ## use monitor EE directly
-        r_reach_list = []
-        for mon in self.monitor:
-            error = mon.get_ee_to_fan_error()
-            r_reach_list.append(error.distance)
-            print("Monitor error distance:", error.distance)
-            # print(f"Monitor error position: {error.position_error}")
-        r_reach_tensor = torch.as_tensor(r_reach_list, device=self.device, dtype=torch.float32)
-        r_reach = -r_reach_tensor
+        # r_reach_list = []
+        # for mon in self.monitor:
+        #     error = mon.get_ee_to_fan_error()
+        #     r_reach_list.append(error.distance)
+        #     print("Monitor error distance:", error.distance)
+        #     # print(f"Monitor error position: {error.position_error}")
+        # r_reach_tensor = torch.as_tensor(r_reach_list, device=self.device, dtype=torch.float32)
+        # r_reach = -r_reach_tensor
         # print("monitor-距離獎勵:", r_reach)
 
         # === 2) 接觸獎勵 ===
@@ -395,16 +420,16 @@ class RoboticEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
 
         # initialize monitors
-        if not self.monitor_initized:
-            for mon in self.monitor:
-                mon.initialize()
+        # if not self.monitor_initized:
+        #     for mon in self.monitor:
+        #         mon.initialize()
 
-            print("PoseMonitor initialized.")
-            self.monitor_initized = True
+        #     print("PoseMonitor initialized.")
+        #     self.monitor_initized = True
         
-        # reset montitors
-        for i in env_ids:
-            self.monitor[i].reset_holding_confirmation()
+        # # reset montitors
+        # for i in env_ids:
+        #     self.monitor[i].reset_holding_confirmation()
 
         # set the root state for the reset envs
         default_root_state = self.robot.data.default_root_state[env_ids]
@@ -465,25 +490,52 @@ class RoboticEnv(DirectRLEnv):
         success_rate = 0.0 if self.total_episodes == 0 else (self.total_touches / self.total_episodes)
         self.extras["log"]["touch_rate"] = torch.tensor(success_rate, device=self.device, dtype=torch.float32)
 
-def quat_mul(q1, q2):
-    # q1, q2: (..., 4) in (w, x, y, z)
-    w1, x1, y1, z1 = q1.unbind(-1)
-    w2, x2, y2, z2 = q2.unbind(-1)
-    return torch.stack([
-        w1*w2 - x1*x2 - y1*y2 - z1*z2,
-        w1*x2 + x1*w2 + y1*z2 - z1*y2,
-        w1*y2 - x1*z2 + y1*w2 + z1*x2,
-        w1*z2 + x1*y2 - y1*x2 + z1*w2,
-    ], dim=-1)
+def axis_string_to_vec(axis: str, device=None, dtype=torch.float32):
+    table = {
+        "+x": (1.0, 0.0, 0.0),
+        "-x": (-1.0, 0.0, 0.0),
+        "+y": (0.0, 1.0, 0.0),
+        "-y": (0.0, -1.0, 0.0),
+        "+z": (0.0, 0.0, 1.0),
+        "-z": (0.0, 0.0, -1.0),
+    }
+    v = torch.tensor(table[axis], device=device, dtype=dtype)
+    return v
 
-def quat_conj(q):
-    # (w, x, y, z)
-    return torch.stack([q[..., 0], -q[..., 1], -q[..., 2], -q[..., 3]], dim=-1)
+def compute_obj_to_approach_R(approach_axis: str, grasp_axis: str, device=None, dtype=torch.float32):
+    """
+    回傳 R_obj_to_approach (3x3)，使得：
+      v_approach = R_obj_to_approach @ v_object
 
-def quat_angle_error(q1, q2):
+    定義：
+      approach frame +X 對齊 object 的 approach_axis
+      approach frame +Y 對齊 object 的 grasp_axis
+      approach frame +Z = +X × +Y (right-hand)
     """
-    Rotation angle between q1 and q2 (radians), in [0, pi]
-    """
-    q_diff = quat_mul(quat_conj(q1), q2)
-    w = torch.clamp(q_diff[..., 0].abs(), max=1.0)
-    return 2.0 * torch.acos(w)
+    x_obj = axis_string_to_vec(approach_axis, device=device, dtype=dtype)  # object frame 中的向量
+    y_obj = axis_string_to_vec(grasp_axis,   device=device, dtype=dtype)
+
+    z_obj = torch.cross(x_obj, y_obj)
+    z_obj = z_obj / (torch.norm(z_obj) + 1e-9)
+
+    # columns = approach axes in object coords
+    # A = [x_obj y_obj z_obj]  (3x3)
+    A = torch.stack([x_obj, y_obj, z_obj], dim=1)
+
+    # 若 columns 是 approach axes in object coords，
+    # 則把 object vector 轉到 approach： v_a = A^T v_o
+    R_obj_to_approach = A.T
+    return R_obj_to_approach
+
+def quat_to_rot_wxyz(q: torch.Tensor) -> torch.Tensor:
+    # q: (...,4) wxyz
+    w, x, y, z = q.unbind(-1)
+    ww, xx, yy, zz = w*w, x*x, y*y, z*z
+    wx, wy, wz = w*x, w*y, w*z
+    xy, xz, yz = x*y, x*z, y*z
+    R = torch.stack([
+        ww+xx-yy-zz, 2*(xy-wz),   2*(xz+wy),
+        2*(xy+wz),   ww-xx+yy-zz, 2*(yz-wx),
+        2*(xz-wy),   2*(yz+wx),   ww-xx-yy+zz
+    ], dim=-1).reshape(q.shape[:-1] + (3, 3))
+    return R

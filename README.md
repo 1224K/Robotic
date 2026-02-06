@@ -94,27 +94,29 @@
 
 - Observation Space
 
-  | Feature                         | Dimension | Description                                    |
-  | ------------------------------- | --------- | ---------------------------------------------- |
-  | Joint positions                 | 7         | Robot arm revolute joints                      |
-  | Joint velocities                | 7         | Angular velocity of each joint                 |
-  | Gripper position                | 1         | Linear position of the slider joint            |
-  | **Fan position**                | 3         | `(x, y, z)` world position of the `Fan` object |
-  | (optional) Plate/Rack positions | 3 each    | Positions of other rigid objects               |
+  | Feature            | Dimension | Description                                                              |
+  | ------------------ | --------- | ------------------------------------------------------------------------ |
+  | **EE position**    | 3         | `ee_pos` (env-local / world frame position after subtracting env_origin) |
+  | **EE quaternion**  | 4         | `ee_quat` in `(w,x,y,z)`                                                 |
+  | **Fan position**   | 3         | `fan_pos` (env-local)                                                    |
+  | **Fan quaternion** | 4         | `fan_quat` in `(w,x,y,z)`                                                |
+  | **Gripper gap**    | 1         | `abs(Slider10 - Slider9)`                                                |
+  | **Prev actions**   | 7         | last action `(Δx,Δy,Δz,Δrx,Δry,Δrz,g)`                                   |
+  | **Total**          | **22**    | `3+4+3+4+1+7 = 22`                                                       |
 
 - Action Space
 
-  | Type       | Dimension | Range                                          | Description                                     |
-  | ---------- | --------- | ---------------------------------------------- | ----------------------------------------------- |
-  | Continuous | 8         | `[-1,1]^7` (revolute) + `[-0.2,0.2]` (gripper) | Joint velocity targets applied to the robot arm |
+  | Type       | Dimension | Range    | Description                                                      |
+  | ---------- | --------- | -------- | ---------------------------------------------------------------- |
+  | Continuous | 7         | `[-1,1]` | `Δx,Δy,Δz,Δrx,Δry,Δrz,g` (relative EE command + gripper command) |
 
 - Reward
 
-  | Name       | formula                           | scale | Description                                                 |
-  | ---------- | --------------------------------- | ----- | ----------------------------------------------------------- |
-  | r_reach    |  \|\|ee_pos - fan_pos\|\|         | -1    | Distance error between the end-effector gripper and the fan |
-  | r_grasp    | 𝟙[grasp_confirmed]                | 200   | Sparse reward when the fan is successfully grasped and held |
-
+  | Name       | formula                           | scale | Description                                                           |
+  | ---------- | --------------------------------- | ----- | -----------------------------------------------------------           |
+  | r_reach    |  \|\|ee_pos - fan_pos\|\|         | -1    | Distance error between the end-effector gripper and the fan           |
+  | r_degree   | angle_deg                         | -0.5  | Orientation penalty: angle difference between EE and fan (in degrees) |
+  | r_grasp    | 𝟙[grasp_confirmed]                | 200   | Sparse reward when the fan is successfully grasped and held           |
 
 - Success Matrix
 

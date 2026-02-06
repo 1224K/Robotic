@@ -37,13 +37,9 @@ while simulation_app.is_running():
         actions = []
         for _ in range(num_envs):
             a = env.single_action_space.sample()  # numpy array shape (8,)
-            # print(a)
-            # if cnt<10:
-            #     a = [1] * 8
-            # else:
-            #     a = [-1] * 8
-            # cnt+=1
-            # cnt %= 20
+            # don't move
+            a = 0.0 * abs(a)
+            # a = [0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]
             actions.append(a)
         actions = torch.tensor(actions, device=env.device, dtype=torch.float32)
         obs, reward, terminated, truncated, info = env.step(actions)

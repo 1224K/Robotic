@@ -22,8 +22,8 @@ class RoboticEnvCfg(DirectRLEnvCfg):
     decimation = 2
     episode_length_s = 10.0
     # - spaces definition
-    action_space = 4
-    observation_space = 19
+    action_space = 7
+    observation_space = 22
     state_space = 0
     # simulation
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
