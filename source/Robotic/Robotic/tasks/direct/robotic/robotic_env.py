@@ -82,9 +82,7 @@ class RoboticEnv(DirectRLEnv):
         self._grasp_frame_count = torch.zeros((self.num_envs,), device=self.device, dtype=torch.int32)
 
         # ===== Grasp thresholds (mirror GraspDetectionConfig defaults) =====
-        # Slider9 ~ +0.02, Slider10 ~ -0.02 when holding
-        self.grip_position_min = 0.018
-        self.grip_position_max = 0.022
+        self.grasp_gap_threshold = 0.03   # slider gap threshold to consider "closed"
 
         # grasp zone by EE/finger-to-fan distance (meters)
         self.grasp_zone_min_m = 0.00
@@ -218,8 +216,8 @@ class RoboticEnv(DirectRLEnv):
         self.fan_pos  = self.fan.data.root_pos_w - self.scene.env_origins
         self.fan_quat = self.fan.data.root_quat_w
 
-        idx10 = self.cfg.dof_names.index("Slider10")
-        idx09 = self.cfg.dof_names.index("Slider9")
+        idx09 = self.grip_dof_ids[0]
+        idx10 = self.grip_dof_ids[1]
         jpos = self.robot.data.joint_pos
         self.gripper_gap = (jpos[:, idx10] - jpos[:, idx09]).abs()
 
@@ -229,21 +227,10 @@ class RoboticEnv(DirectRLEnv):
         return touch
     
     def _check_grasped(self) -> torch.Tensor:
-        # --- (1) gripper closed check (symmetric range) ---
-        idx10 = self.cfg.dof_names.index("Slider10")
-        idx09 = self.cfg.dof_names.index("Slider9")
-        jpos = self.robot.data.joint_pos  # (N, dof)
-
-        slider9  = jpos[:, idx09]
-        slider10 = jpos[:, idx10]
-
-        slider9_ok  = (slider9  >= self.grip_position_min) & (slider9  <= self.grip_position_max)
-        slider10_ok = (slider10 >= -self.grip_position_max) & (slider10 <= -self.grip_position_min)
-        is_closed = slider9_ok & slider10_ok
+        # --- (1) gripper closed check ---
+        is_closed = self.gripper_gap >= self.grasp_gap_threshold
 
         # --- (2) grasp zone check (distance to fan) ---
-        # PoseMonitor uses EE-to-fan error distance; in your env you already use finger midpoint to reach,
-        # so we'll use finger_pos to fan_pos for grasp-zone.
         ee_dist = torch.linalg.norm(self.ee_pos - self.fan_pos, dim=-1)
         is_in_zone = (ee_dist >= self.grasp_zone_min_m) & (ee_dist <= self.grasp_zone_max_m)
 
@@ -258,13 +245,6 @@ class RoboticEnv(DirectRLEnv):
 
         self.grasp_buf = confirmed
         return self.grasp_buf
-
-        # grasped_list = []
-        # for mon in self.monitor:
-        #     grasped = mon.is_holding_fan()
-        #     grasped_list.append(grasped)
-        # grasped_tensor = torch.as_tensor(grasped_list, device=self.device, dtype=torch.bool)
-        # return grasped_tensor
     
     def _update_jacobian(self):
         # 1) EE body index (cache once is fine)
@@ -326,8 +306,10 @@ class RoboticEnv(DirectRLEnv):
         # gripper: map g_cmd (-1..1) -> slider speed (m/s)
         # IMPORTANT: keep small to avoid contact blow-ups
         g_speed = torch.clamp(g_cmd, -1.0, 1.0) * 0.05  # 0.05 m/s safe start
+        # [NOTE] push stage frozen gripper 
+        g_speed = 0
 
-        joint_vels[:, self.grip_dof_ids[0]] =  g_speed   # Slider9
+        joint_vels[:, self.grip_dof_ids[0]] = g_speed   # Slider9
         joint_vels[:, self.grip_dof_ids[1]] = -g_speed   # Slider10
 
         # ---- 8) apply ----
@@ -336,7 +318,6 @@ class RoboticEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         self._compute_intermediate()
 
-        rel_pos = self.ee_pos - self.fan_pos
         obs_list = [
             self.ee_pos,                # 3
             self.ee_quat,               # 4
@@ -354,24 +335,24 @@ class RoboticEnv(DirectRLEnv):
         self._compute_intermediate()
 
         # === 1) 距離 ===
-        rel = self.ee_pos - self.fan_pos
-        r_reach = -torch.linalg.norm(rel, dim=-1)
+        # rel = self.ee_pos - self.fan_pos
+        # r_reach = -torch.linalg.norm(rel, dim=-1)
         # print("距離獎勵:", r_reach)
 
-        # === 角度 ===
-        R_ee  = quat_to_rot_wxyz(self.ee_quat)     # world<-ee(TF_1)
-        R_fan = quat_to_rot_wxyz(self.fan_quat)    # world<-fan(object)
+        # # === 角度 ===
+        # R_ee  = quat_to_rot_wxyz(self.ee_quat)     # world<-ee(TF_1)
+        # R_fan = quat_to_rot_wxyz(self.fan_quat)    # world<-fan(object)
 
-        # world<-fan_approach = world<-fan_object @ object<-approach
-        R_fan_app = R_fan @ self.R_obj_to_approach.T
+        # # world<-fan_approach = world<-fan_object @ object<-approach
+        # R_fan_app = R_fan @ self.R_obj_to_approach.T
 
-        # angle between EE and fan_approach
-        trace = R_ee.transpose(-1, -2) @ R_fan_app
-        tr = trace[..., 0, 0] + trace[..., 1, 1] + trace[..., 2, 2]
-        c = torch.clamp((tr - 1.0) * 0.5, -1.0, 1.0)
-        ang = torch.acos(c)
+        # # angle between EE and fan_approach
+        # trace = R_ee.transpose(-1, -2) @ R_fan_app
+        # tr = trace[..., 0, 0] + trace[..., 1, 1] + trace[..., 2, 2]
+        # c = torch.clamp((tr - 1.0) * 0.5, -1.0, 1.0)
+        # ang = torch.acos(c)
 
-        r_angle = -0.5 * ang
+        # r_angle = -0.5 * ang
         # print("角度獎勵:", r_angle)
 
         ## use monitor EE directly
@@ -386,17 +367,21 @@ class RoboticEnv(DirectRLEnv):
         # print("monitor-距離獎勵:", r_reach)
 
         # === 2) 接觸獎勵 ===
-        touch = self._check_touch()
-        newly_touch = touch & (~self.touch_buf)
-        r_touch = newly_touch.float() * 5.0
-        self.touch_buf |= touch
+        # touch = self._check_touch()
+        # newly_touch = touch & (~self.touch_buf)
+        # r_touch = newly_touch.float() * 5.0
+        # self.touch_buf |= touch
         
-        # === 2) 抓取獎勵 ===
-        grasped = self._check_grasped()
-        self.grasp_success_buf = grasped.clone()
-        r_grasp = grasped.float() * 200.0
+        # # === 2) 抓取獎勵 ===
+        # grasped = self._check_grasped()
+        # self.grasp_success_buf = grasped.clone()
+        # r_grasp = grasped.float() * 200.0
 
-        rew = r_reach + r_grasp + r_angle
+        # === 3) 插入獎勵 ===
+        rel = torch.tensor(self.cfg.target1, device=self.device) - self.fan_pos
+        r_insert = -torch.linalg.norm(rel, dim=-1)
+
+        rew = r_insert  
         # === 狀態記錄 ===
         self.prev_actions = self.actions.clone()
 
@@ -405,13 +390,16 @@ class RoboticEnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
         self._compute_intermediate()
-        grasped = self._check_grasped()
+        # s_grasp = self._check_grasped()
         # touching = self._check_touch()
-        touching = False
+        # touching = False
 
-        success = grasped | touching
+        s_insert = torch.linalg.norm(torch.tensor(self.cfg.target1, device=self.device) - self.fan_pos, dim=-1) < 0.05
 
-        done = time_out | success
+        # if ee far from fan for too long, time out
+        time_out |= torch.linalg.norm(self.ee_pos - self.fan_pos, dim=-1) > self.grasp_zone_max_m
+
+        done = time_out | s_insert
         return done, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
@@ -438,9 +426,8 @@ class RoboticEnv(DirectRLEnv):
 
         # joints: 打開夾爪，手臂回到 default（或你自定 reset 姿）
         jpos = self.robot.data.default_joint_pos[env_ids].clone()
-        # 讓夾爪張開一點（0.02 m 之類）
-        jpos[:, 7] =  0.02
-        jpos[:, 8] = -0.02
+        # jpos[:, self.grip_dof_ids[0]] =  0.02
+        # jpos[:, self.grip_dof_ids[1]] = -0.02
         jvel = torch.zeros_like(jpos)
         self.robot.write_joint_state_to_sim(jpos, jvel, env_ids=env_ids)
         self.robot.reset()

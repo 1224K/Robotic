@@ -46,9 +46,13 @@ class RoboticEnvCfg(DirectRLEnvCfg):
     robot_description_path: str = str(ASSET_DIR / "robot_description.yaml")
     robot_urdf_path: str = str(ASSET_DIR / "RS-M90E7A.urdf")
     
-    fan_spawn_base: tuple[float,float,float] = (0.45, -0.77, 0.5)
+    # fan_spawn_base: tuple[float,float,float] = (0.45, -0.77, 0.5)
+    # fan_spawn_base: tuple[float,float,float] = (-0.16564, -0.60007, 0.75688)
+    fan_spawn_base: tuple[float,float,float] = (-0.16564, -0.60007, 0.75800)
     plate_spawn_base: tuple[float,float,float] = (0.3, -1.0, 0.32)
     rack_spawn_base: tuple[float,float,float]  = (-0.2, -1.0, 0.46)
+
+    target1: tuple[float,float,float] = (-0.0791, -0.9935, 0.56916)
 
     # 隨機擾動
     fan_pos_noise_xyz: tuple[float,float,float] = (0.00, 0.00, 0.0) # XY 亂數擺放

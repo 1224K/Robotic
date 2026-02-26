@@ -128,10 +128,12 @@
   | r_reach    |  \|\|ee_pos - fan_pos\|\|         | -1    | Distance error between the end-effector gripper and the fan           |
   | r_degree   | angle_deg                         | -0.5  | Orientation penalty: angle difference between EE and fan (in degrees) |
   | r_grasp    | 𝟙[grasp_confirmed]                | 200   | Sparse reward when the fan is successfully grasped and held           |
+  | r_insert   | \|\|target_pos - fan_pos\|\|      | -1    | Distance error between the target and the fan                         |
 
 - Success Matrix
 
-  | Name       | formula                           | Description                                                 |
-  | ---------- | --------------------------------- | ----------------------------------------------------------- |
-  | s_reach    |  \|\|ee_pos - fan_pos\|\| < 0.15  | Whether the end-effector gripper is close enough to the fan |
-  | s_grasp    | grasp_confirmed                   | Whether the fan is successfully grasped and held    |
+  | Name       | formula                             | Description                                                 |
+  | ---------- | ----------------------------------- | ----------------------------------------------------------- |
+  | s_reach    |  \|\|ee_pos - fan_pos\|\| < 0.15    | Whether the end-effector gripper is close enough to the fan |
+  | s_grasp    | grasp_confirmed                     | Whether the fan is successfully grasped and held            |
+  | s_insert   | \|\|target_pos - fan_pos\|\| < 0.05 | Whether the fan is is close enough to the target            |
