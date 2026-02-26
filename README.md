@@ -71,7 +71,16 @@
       --video \
       --video_length=1000 \
       --num_envs=20 \
-      --max_iterations=500
+      --max_iterations=1000
+
+    # Under the outermost Robotic/ directory
+    python scripts/rl_games/train.py --task=Template-Robotic-Direct-v0 \
+      agent.params.config.horizon_length=512 \
+      agent.params.config.minibatch_size=512 \
+      agent.params.config.mini_epochs=6 \
+      --num_envs=20 \
+      --video \
+      --video_length=1000
 
 7. Play with checkpoint
 

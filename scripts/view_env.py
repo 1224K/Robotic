@@ -38,7 +38,7 @@ while simulation_app.is_running():
         for _ in range(num_envs):
             a = env.single_action_space.sample()  # numpy array shape (8,)
             # don't move
-            a = 0.0 * abs(a)
+            # a = 0.0 * abs(a)
             # a = [0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]
             actions.append(a)
         actions = torch.tensor(actions, device=env.device, dtype=torch.float32)

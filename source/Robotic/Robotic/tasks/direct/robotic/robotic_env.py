@@ -138,11 +138,11 @@ class RoboticEnv(DirectRLEnv):
         
         self.fan = RigidObject(fan_cfg)
 
-        # plate = sim_utils.UsdFileCfg(usd_path=self.cfg.plate_usd)
-        # plate.func("/World/envs/env_.*/plate", plate, translation=self.cfg.plate_spawn_base)
+        plate = sim_utils.UsdFileCfg(usd_path=self.cfg.plate_usd)
+        plate.func("/World/envs/env_.*/plate", plate, translation=self.cfg.plate_spawn_base)
 
-        # rack = sim_utils.UsdFileCfg(usd_path=self.cfg.rack_usd)
-        # rack.func("/World/envs/env_.*/rack", rack, translation=self.cfg.rack_spawn_base)
+        rack = sim_utils.UsdFileCfg(usd_path=self.cfg.rack_usd)
+        rack.func("/World/envs/env_.*/rack", rack, translation=self.cfg.rack_spawn_base)
 
         # clone and replicate
         self.scene.clone_environments(copy_from_source=True)

@@ -8,7 +8,7 @@ from pathlib import Path
 # 這支 .py 檔案所在的位置
 HERE = Path(__file__).resolve()
 REPO_ROOT = HERE.parents[5]
-ASSET_DIR = REPO_ROOT / "Robotic"
+ASSET_DIR = REPO_ROOT / "Robotic/assets"
 
 RS_M90E7A_CONFIG = ArticulationCfg(
     prim_path="{ENV_REGEX_NS}/RS_M90E7A",
@@ -20,14 +20,13 @@ RS_M90E7A_CONFIG = ArticulationCfg(
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=True,
-            solver_position_iteration_count=8,
+            solver_position_iteration_count=8, #default 8
             solver_velocity_iteration_count=8,
         ),
     ),
     init_state=ArticulationCfg.InitialStateCfg(
         pos=(0.0, 0.0, 0.0),
-        # rot=(1.0, 0.0, 0.0, 0.0),
-        rot=(math.cos(math.radians(-25)/2), 0.0, 0.0, math.sin(math.radians(-25)/2)),
+        rot=(0.70710678, 0.0, 0.0, -0.70710678),  # z軸 -90度
         joint_pos={
             # 7 軸
             "Revolute1": 0.0,

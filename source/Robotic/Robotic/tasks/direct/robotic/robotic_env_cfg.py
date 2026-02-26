@@ -14,7 +14,7 @@ HERE = Path(__file__).resolve()
 # 比方說這支檔案在 <repo_root>/source/configs/my_cfg.py
 # 那 repo_root 就是 HERE.parents[2]
 REPO_ROOT = HERE.parents[7]
-ASSET_DIR = REPO_ROOT / "Robotic"
+ASSET_DIR = REPO_ROOT / "Robotic/assets"
 
 @configclass
 class RoboticEnvCfg(DirectRLEnvCfg):
@@ -46,9 +46,9 @@ class RoboticEnvCfg(DirectRLEnvCfg):
     robot_description_path: str = str(ASSET_DIR / "robot_description.yaml")
     robot_urdf_path: str = str(ASSET_DIR / "RS-M90E7A.urdf")
     
-    fan_spawn_base: tuple[float,float,float] = (-0.3, -0.8, 0.0)
-    plate_spawn_base: tuple[float,float,float] = (-0.3, -0.8, 0.0)
-    rack_spawn_base: tuple[float,float,float]  = (-0.3, -0.8, 0.0)
+    fan_spawn_base: tuple[float,float,float] = (0.45, -0.77, 0.5)
+    plate_spawn_base: tuple[float,float,float] = (0.3, -1.0, 0.32)
+    rack_spawn_base: tuple[float,float,float]  = (-0.2, -1.0, 0.46)
 
     # 隨機擾動
     fan_pos_noise_xyz: tuple[float,float,float] = (0.00, 0.00, 0.0) # XY 亂數擺放
