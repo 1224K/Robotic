@@ -14,30 +14,32 @@
     cd Robotic
     python -m pip install -e source/Robotic
   
-4. Download the USD files from Google Drive, unzip them, and place them in the project root directory.
+4. Download the USD files from Google Drive, unzip them, and place them in the assets directory.
   
     ```bash
     Robotic/
+    ├── assets/
+    |   ├── Fan.usd
+    |   ├── Plate.usd
+    |   ├── Rack.usd
+    |   └── RobotLeftArm.usd
     ├── scripts/
     │   ├── rl_games/
     │   │   ├── train.py
     │   │   └── play.py
     │   ├── list_envs.py
-    │   ├── view_env.py                            (Random Agent 測試環境)
-    ├── source/
-    |   └── Robotic/
-    │       └── Robotic/
-    │           ├── robots/
-    │           │   └── RS_M90E7A.py               (左手臂的配置檔，目前是用速度控制)
-    │           ├── tasks/
-    │           │   └── direct/
-    │           │       └── robotic/
-    │           │           ├── robotic_env.py     (如何跟環境互動，獎勵訊號)
-    │           │           └── robotic_env_cfg.py (初始要用到的一些參數值)
-    ├── Fan.usd
-    ├── Plate.usd
-    ├── Rack.usd
-    └── RobotLeftArm.usd
+    │   └── view_env.py                            (Random Agent 測試環境)
+    └── source/
+        └── Robotic/
+            └── Robotic/
+                ├── robots/
+                │   └── RS_M90E7A.py               (左手臂的配置檔，目前是用速度控制)
+                └── tasks/
+                    └── direct/
+                        └── robotic/
+                            ├── robotic_env.py     (如何跟環境互動，獎勵訊號)
+                            └── robotic_env_cfg.py (初始要用到的一些參數值)
+    
     ```
 
 5. Verify that the extension is correctly installed by:
