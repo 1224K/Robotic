@@ -29,6 +29,9 @@ import numpy as np
 from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
 from .pose_monitor import PoseMonitor
 from .grasp_config import GraspDetectionConfig
+from isaaclab.sensors import Camera, CameraCfg
+
+import torch.nn as nn
 
 class RoboticEnv(DirectRLEnv):
     cfg: RoboticEnvCfg
@@ -76,10 +79,12 @@ class RoboticEnv(DirectRLEnv):
 
         self.total_episodes = 0
         self.total_touches = 0
+        self.total_inserts = 0
 
         # ===== Grasp (holding) detection buffers =====
         self.grasp_buf = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
         self._grasp_frame_count = torch.zeros((self.num_envs,), device=self.device, dtype=torch.int32)
+        self.insert_success_buf = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
 
         # ===== Grasp thresholds (mirror GraspDetectionConfig defaults) =====
         self.grasp_gap_threshold = 0.03   # slider gap threshold to consider "closed"
@@ -102,6 +107,15 @@ class RoboticEnv(DirectRLEnv):
             device=self.device,
             dtype=torch.float32,
         )
+
+        self.rgbd_encoder = nn.Sequential(
+            nn.Conv2d(4, 16, 3, stride=2, padding=1), nn.ReLU(),   # 64x64
+            nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ReLU(),  # 32x32
+            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),  # 16x16
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(64, 128),
+        ).to(self.device)
 
         # test
         print("dt =", self.cfg.sim.dt, "decimation =", self.cfg.decimation)
@@ -154,6 +168,32 @@ class RoboticEnv(DirectRLEnv):
 
         self.jacobians = None
 
+        # add camera
+        roll  = torch.tensor(60.0  * torch.pi / 180.0, device=self.device, dtype=torch.float32)
+        pitch = torch.tensor(0.0  * torch.pi / 180.0, device=self.device, dtype=torch.float32)
+        yaw   = torch.tensor(-90.0 * torch.pi / 180.0, device=self.device, dtype=torch.float32)
+
+        cam_cfg = CameraCfg(
+            prim_path="/World/envs/env_.*/Robot/RS_M90E7A_Left/TF_1/Camera_wrist",
+            spawn=sim_utils.PinholeCameraCfg(
+                focal_length=18,
+                horizontal_aperture=36,
+                vertical_aperture=36,
+                clipping_range=(0.01, 20.0),
+            ),
+            offset=CameraCfg.OffsetCfg(
+                pos=(0.03, 0.0, 0.15),     
+                rot = math_utils.quat_from_euler_xyz(roll, pitch, yaw),
+                convention="opengl"
+            ),
+            update_latest_camera_pose=True,
+            data_types=["rgb","depth"],        
+            width=128,
+            height=128,
+            update_period=self.cfg.sim.dt * self.cfg.decimation,
+        )
+        self.wrist_cam = Camera(cam_cfg)
+        self.scene.sensors["wrist_cam"] = self.wrist_cam
         # monitor
         # self.monitor = []
         # for i in range(self.num_envs):
@@ -301,13 +341,14 @@ class RoboticEnv(DirectRLEnv):
         # arm
         dt = self.cfg.sim.dt * self.cfg.decimation
         qd_arm = (q_des - q_arm) / dt
+        # qd_arm = torch.clamp(qd_arm, -20.0, 20.0)   # limit max speed for safety (rad/s)
         joint_vels[:, self.arm_dof_ids] = qd_arm
 
         # gripper: map g_cmd (-1..1) -> slider speed (m/s)
         # IMPORTANT: keep small to avoid contact blow-ups
         g_speed = torch.clamp(g_cmd, -1.0, 1.0) * 0.05  # 0.05 m/s safe start
         # [NOTE] push stage frozen gripper 
-        g_speed = 0
+        g_speed = 0.0
 
         joint_vels[:, self.grip_dof_ids[0]] = g_speed   # Slider9
         joint_vels[:, self.grip_dof_ids[1]] = -g_speed   # Slider10
@@ -317,6 +358,27 @@ class RoboticEnv(DirectRLEnv):
     
     def _get_observations(self) -> dict:
         self._compute_intermediate()
+        out = self.wrist_cam.data.output
+        rgb = out["rgb"]  # (N,128,128,3) uint8
+        depth = out["depth"]   # (N,128,128,1) float32
+        # --- RGB -> (N,3,H,W), normalize 0..1 ---
+        rgb = rgb.permute(0, 3, 1, 2).float() / 255.0
+
+        # --- Depth -> (N,1,H,W), sanitize + clamp + normalize ---
+        depth = depth.permute(0, 3, 1, 2)  # already float32
+
+        # deal NaN/Inf
+        depth = torch.nan_to_num(depth, nan=0.0, posinf=2.0, neginf=0.0)
+        depth_max = 2.0  # meters
+        depth = torch.clamp(depth, 0.0, depth_max)
+        depth = depth / depth_max          # -> 0..1
+
+        # --- RGBD 4ch ---
+        rgbd = torch.cat([rgb, depth], dim=1)  # (N,4,128,128)
+
+        # --- Encode to low-dim feature ---
+        with torch.no_grad():  # 先建議關掉梯度，穩定/快
+            cam_feat = self.rgbd_encoder(rgbd)  # (N,128)
 
         obs_list = [
             self.ee_pos,                # 3
@@ -324,9 +386,10 @@ class RoboticEnv(DirectRLEnv):
             self.fan_pos,               # 3
             self.fan_quat,              # 4
             self.gripper_gap.unsqueeze(-1),  # 1
+            cam_feat,                   # 128
             self.prev_actions           # 7
         ]
-        obs = torch.cat(obs_list, dim=-1)  # 維度 = 3+4+4+3+1+4 = 19
+        obs = torch.cat(obs_list, dim=-1)  # 維度 = 3+4+3+4+1+128+7 = 150
         self.cfg.observation_space = obs.shape[-1]  # 動態校正
 
         return {"policy": obs}
@@ -381,7 +444,10 @@ class RoboticEnv(DirectRLEnv):
         rel = torch.tensor(self.cfg.target1, device=self.device) - self.fan_pos
         r_insert = -torch.linalg.norm(rel, dim=-1)
 
-        rew = r_insert  
+        # === 3) 脫落逞罰 ===
+        r_drop = (torch.linalg.norm(self.ee_pos - self.fan_pos, dim=-1) > 0.9) * -100.0
+
+        rew = r_insert + r_drop
         # === 狀態記錄 ===
         self.prev_actions = self.actions.clone()
 
@@ -396,8 +462,12 @@ class RoboticEnv(DirectRLEnv):
 
         s_insert = torch.linalg.norm(torch.tensor(self.cfg.target1, device=self.device) - self.fan_pos, dim=-1) < 0.05
 
+        self.insert_success_buf = s_insert.clone()
+
+        fan_bad = ~torch.isfinite(self.fan_pos).all(dim=-1)
+        time_out |= fan_bad
         # if ee far from fan for too long, time out
-        time_out |= torch.linalg.norm(self.ee_pos - self.fan_pos, dim=-1) > self.grasp_zone_max_m
+        time_out |= torch.linalg.norm(self.ee_pos - self.fan_pos, dim=-1) > 0.1
 
         done = time_out | s_insert
         return done, time_out
@@ -454,6 +524,7 @@ class RoboticEnv(DirectRLEnv):
 
         ep_touch = self.touch_buf[env_ids].int()
         self.episode_touch_count[env_ids] = ep_touch
+        ep_insert = self.insert_success_buf[env_ids].int()
 
         self._grasp_frame_count[env_ids] = 0
         self.grasp_buf[env_ids] = False
@@ -463,6 +534,7 @@ class RoboticEnv(DirectRLEnv):
         # 更新全域統計（Python int）
         self.total_episodes += int(len(env_ids))
         self.total_touches += int(ep_touch.sum().item())
+        self.total_inserts += int(ep_insert.sum().item())
 
         # reset success flag
         self.touch_buf[env_ids] = False
@@ -472,10 +544,17 @@ class RoboticEnv(DirectRLEnv):
 
         # (A) per-episode success for the envs that just ended (mean over reset envs)
         self.extras["log"]["touch_success_mean"] = ep_touch.float().mean()
+        self.extras["log"]["insert_success_mean"] = ep_insert.float().mean()
 
         # (B) your global running success rate
-        success_rate = 0.0 if self.total_episodes == 0 else (self.total_touches / self.total_episodes)
-        self.extras["log"]["touch_rate"] = torch.tensor(success_rate, device=self.device, dtype=torch.float32)
+        touch_rate = 0.0 if self.total_episodes == 0 else (self.total_touches / self.total_episodes)
+        self.extras["log"]["touch_rate"] = torch.tensor(touch_rate, device=self.device, dtype=torch.float32)
+        insert_rate = 0.0 if self.total_episodes == 0 else (self.total_inserts / self.total_episodes)
+        self.extras["log"]["insert_rate"] = torch.tensor(
+            insert_rate,
+            device=self.device,
+            dtype=torch.float32
+        )
 
 def axis_string_to_vec(axis: str, device=None, dtype=torch.float32):
     table = {

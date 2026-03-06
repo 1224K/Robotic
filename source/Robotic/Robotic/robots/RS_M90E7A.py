@@ -79,7 +79,7 @@ RS_M90E7A_CONFIG = ArticulationCfg(
             velocity_limit_sim=2.3,   # m/s
             stiffness=0.0,
             damping=0.0,
-            # damping=40.0,
+            # stiffness=1000000.0,
         ),
     },
 )

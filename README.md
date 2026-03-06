@@ -60,7 +60,7 @@
       ```bash
       # Under the outermost Robotic/ directory
       # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-      python scripts/view_env.py
+      python scripts/view_env.py --enable_cameras
       ```
 
 6. Train an RL agent
@@ -112,8 +112,9 @@
   | **Fan position**   | 3         | `fan_pos` (env-local)                                                    |
   | **Fan quaternion** | 4         | `fan_quat` in `(w,x,y,z)`                                                |
   | **Gripper gap**    | 1         | `abs(Slider10 - Slider9)`                                                |
+  | **Wrist Camera**   | 128       | 128-D feature from wrist RGB-D via a small CNN encoder                   |
   | **Prev actions**   | 7         | last action `(Δx,Δy,Δz,Δrx,Δry,Δrz,g)`                                   |
-  | **Total**          | **22**    | `3+4+3+4+1+7 = 22`                                                       |
+  | **Total**          | **150**   | `3+4+3+4+1+128+7 = 150`                                                  |
 
 - Action Space
 
@@ -129,6 +130,7 @@
   | r_degree   | angle_deg                               | -0.5  | Orientation penalty: angle difference between EE and fan (in degrees) |
   | r_grasp    | 𝟙[grasp_confirmed]                      | 200   | Sparse reward when the fan is successfully grasped and held           |
   | r_insert   | \|\|target_pos - fan_pos\|\|            | -1    | Distance error between the target and the fan                         |
+  | r_drop     | 1 - 𝟙[grasp_confirmed]                  | -10   | Penalty when the fan is held but then dropped                         |
 
 - Success Matrix
 

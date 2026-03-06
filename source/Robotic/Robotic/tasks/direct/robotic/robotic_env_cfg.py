@@ -23,7 +23,7 @@ class RoboticEnvCfg(DirectRLEnvCfg):
     episode_length_s = 10.0
     # - spaces definition
     action_space = 7
-    observation_space = 22
+    observation_space = 150
     state_space = 0
     # simulation
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
